@@ -1167,7 +1167,102 @@ def _load_progress_line(ld, frame=0):
     return "  ".join(b for b in bits if b) + RESET
 
 
-def _post_load_with_progress(ctrl, name, do_post):
+def _unload_progress_line(name, est, elapsed, frame=0):
+    """One redraw of the unload bar. With a measured unload time for this model
+    (or a learned rate) it fills against that; before the board has timed any
+    unload there is nothing to measure against, so the bar sweeps instead."""
+    pct = min(99.0, elapsed / est * 100.0) if est else None   # 99: done when the call returns
+    bits = [f"{progress_bar(pct, frame)}{MUTED}" + (f" {int(pct)}%" if pct is not None else "")]
+    bits.append(f"unloading {name}")
+    bits.append(fmt_secs(elapsed))
+    if est:
+        remain = est - elapsed
+        bits.append(f"~{fmt_secs(remain)} left" if remain >= 0.5 else "finishing…")
+    return "  ".join(bits) + RESET
+
+
+def _call_with_live_line(render, call):
+    """Run the blocking `call` on a worker thread while `render` animates one
+    status line; return its result or re-raise its error. `call` runs directly,
+    with nothing drawn, when stdout is not a terminal."""
+    if not _animate():
+        return call()
+    box = {}
+
+    def _work():
+        try:
+            box["result"] = call()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
+            box["error"] = exc
+
+    worker = threading.Thread(target=_work, name="live-call", daemon=True)
+    with LiveLine(render):
+        worker.start()
+        while worker.is_alive():
+            worker.join(0.2)
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
+def unload_model(ctrl, name):
+    """Unload a model via the control API, with a progress bar. Returns True on
+    success."""
+    try:
+        hint = next((m for m in catalog(ctrl) if m.get("name") == name), {}) or {}
+    except Exception:
+        hint = {}
+    est = hint.get("estimatedUnloadS")
+    est = float(est) if isinstance(est, (int, float)) and est > 0 else None
+    if not _animate():
+        print(f"{MUTED}  unloading {name}…{RESET}")
+
+    def _attempt():
+        r = ctrl_post(ctrl, "/control/unload", {"name": name})
+        if isinstance(r, dict) and r.get("error"):
+            raise RuntimeError(r["error"])
+        return r
+
+    try:
+        r = _call_with_live_line(
+            lambda frame, elapsed: f"  {spinner_frame(frame)} "
+            + _unload_progress_line(name, est, elapsed, frame), _attempt)
+    except Exception as exc:  # noqa: BLE001
+        print(f"{ERR}  {exc}{RESET}")
+        return False
+    if isinstance(r, dict) and r.get("state") == "absent":
+        print(f"{MUTED}  {name} was not loaded.{RESET}")
+        return True
+    secs = r.get("unload_seconds") if isinstance(r, dict) else None
+    tnote = f" {DIM}(in {secs:.1f}s){RESET}" if isinstance(secs, (int, float)) and secs > 0 else ""
+    print(f"{OK}✔ unloaded {name}{RESET}{tnote}")
+    return True
+
+
+def _load_victims(ctrl, name):
+    """(name, expected unload seconds or None) for each model that loading
+    `name` will push out: the least recently used ones beyond the limit, as the
+    server picks them. Empty when there is room, or when status is unavailable."""
+    try:
+        status = ctrl_get(ctrl, "/control/status") or {}
+    except Exception:
+        return []
+    resident = status.get("resident")
+    if not isinstance(resident, list):
+        return []
+    if name in resident:
+        return []                                    # already loaded: nothing moves
+    limit = status.get("maxResident")
+    limit = int(limit) if isinstance(limit, (int, float)) and limit >= 1 else 1
+    by_name = {m.get("name"): m for m in status.get("catalog") or []}
+    victims = []
+    for victim in resident[limit - 1:]:
+        est = (by_name.get(victim) or {}).get("estimatedUnloadS")
+        victims.append((victim, float(est) if isinstance(est, (int, float)) and est > 0 else None))
+    return victims
+
+
+def _post_load_with_progress(ctrl, name, do_post, victims=()):
     """Run `do_post` on a worker thread and draw live load progress until it
     returns. Falls back to the plain blocking call when stdout is not a TTY (a
     redirected log should not collect carriage returns and escape codes)."""
@@ -1192,10 +1287,23 @@ def _post_load_with_progress(ctrl, name, do_post):
     stages = hint.get("stagesTotal")
     reported = {"ld": None, "at": 0.0}      # the server's own progress, when it answers
     shown = {"pct": 0.0}
+    # Making room comes first. Time the unloading phase from the victims' own
+    # measured unload times when there are any; the server says so itself when
+    # it can be reached.
+    unload_est = sum(secs or 0.0 for _victim, secs in victims)
+    victim_names = ", ".join(victim for victim, _est in victims)
 
     def _render(frame, elapsed):
         ld = reported["ld"]
-        if ld and time.monotonic() - reported["at"] < 1.5:
+        fresh = bool(ld) and time.monotonic() - reported["at"] < 1.5
+        if fresh and ld.get("phase") == "unloading":
+            return (f"  {spinner_frame(frame)} " + _unload_progress_line(
+                ld.get("victim") or victim_names, unload_est or None, elapsed, frame))
+        if victims and not fresh and unload_est and elapsed < unload_est:
+            return (f"  {spinner_frame(frame)} "
+                    + _unload_progress_line(victim_names, unload_est, elapsed, frame))
+        elapsed = max(0.0, elapsed - unload_est)     # the load's own clock
+        if fresh:
             ld = dict(ld, elapsedS=elapsed)
         else:
             # Recomputed every frame, so the bar glides instead of stepping.
@@ -1228,16 +1336,13 @@ def _post_load_with_progress(ctrl, name, do_post):
 
 
 def load_model(ctrl, name, oai=None, auto_retry=True):
-    """Load a model via the control API. Returns True on success. Loading a
-    chat/VLM model evicts any other resident one, so that is made explicit."""
-    try:
-        resident = [m.get("name") for m in catalog(ctrl)
-                    if m.get("loaded") and m.get("type", "chat") != "asr"
-                    and m.get("name") != name]
-    except Exception:
-        resident = []
-    if resident:
-        print(f"{MUTED}  unloading {', '.join(resident)}, then loading {name}…{RESET}")
+    """Load a model via the control API. Returns True on success. Loading past
+    the resident limit pushes out the least recently used model(s), so that is
+    made explicit."""
+    victims = _load_victims(ctrl, name)
+    if victims:
+        names = ', '.join(victim for victim, _est in victims)
+        print(f"{MUTED}  unloading {names}, then loading {name}…{RESET}")
     else:
         print(f"{MUTED}  loading {name}…{RESET}")
 
@@ -1248,7 +1353,7 @@ def load_model(ctrl, name, oai=None, auto_retry=True):
         return r
 
     try:
-        r = _post_load_with_progress(ctrl, name, _attempt)
+        r = _post_load_with_progress(ctrl, name, _attempt, victims)
     except Exception as exc:  # noqa: BLE001
         print(f"{ERR}  {exc}{RESET}")
         return False
@@ -2448,14 +2553,9 @@ def main():
                     print(f"{MUTED}  no LLM/VLM is loaded.{RESET}")
                     continue
                 for name in names:
-                    try:
-                        ctrl_post(ctrl, "/control/unload", {"name": name})
-                        print(f"{OK}✔ unloaded {name}{RESET}")
-                        if name == active:
-                            active = ""
-                            camera_device = None   # no model → live camera can't send
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"{ERR}  {exc}{RESET}")
+                    if unload_model(ctrl, name) and name == active:
+                        active = ""
+                        camera_device = None   # no model → live camera can't send
             elif cmd in ("delete", "rm", "remove"):
                 # Delete a model's weights from disk (server unloads it first if
                 # resident and refuses the pinned ASR model). Irreversible, so

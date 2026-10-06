@@ -43,7 +43,11 @@ from asr_switching_suite import (  # noqa: E402
     MlaFailureClassificationTests,
 )
 from hub_security_suite import HubPathSecurityTests  # noqa: E402,F401
-from multi_model_suite import MlaMemoryTests, ResidentLimitTests  # noqa: E402,F401
+from multi_model_suite import (  # noqa: E402,F401
+    MlaMemoryTests,
+    ResidentLimitTests,
+    UnloadTimingTests,
+)
 from cli_think_suite import (  # noqa: E402,F401
     LiveStatusLineTests as CliLiveStatusLineTests,
     NoThinkRewriteTests as CliNoThinkRewriteTests,

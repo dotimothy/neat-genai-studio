@@ -4308,7 +4308,10 @@ async function changeResidentLimit(limit) {
   }
   _modelBusy = true;
   updateManageButtons();
-  setModelStatus('Updating the maximum number of loaded models…', 'loading');
+  setModelStatus(limit < loaded
+    ? 'Unloading models to fit the new maximum…'
+    : 'Updating the maximum number of loaded models…', 'loading');
+  if (limit < loaded) setModelLoadBar('active');
   try {
     const resp = await fetch('/models/max-resident', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -4323,6 +4326,7 @@ async function changeResidentLimit(limit) {
   } catch (err) {
     setModelStatus(`Could not change the limit: ${err.message}`, 'error');
   } finally {
+    setModelLoadBar(null);
     _modelBusy = false;
     await refreshCatalog();
   }
@@ -4752,7 +4756,10 @@ async function unloadModel(name) {
   if (!window.confirm(`Unload "${name}" from the accelerator? You can load it again anytime.`)) return;
   _modelBusy = true;
   updateManageButtons();
-  setModelStatus(`Unloading ${name}…`, 'loading');
+  // Same bar as a load. It fills against this model's measured unload time
+  // once the board has timed one; before that it sweeps.
+  const hint = _catalog.find(m => m.name === name) || {};
+  startLoadTicker(name, hint.estimatedUnloadS, null, 'Unloading');
   try {
     const resp = await fetch('/models/unload', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -4760,10 +4767,16 @@ async function unloadModel(name) {
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(data.error || 'unload failed');
-    setModelStatus(`Unloaded ${name}`, 'muted');
+    stopLoadTicker();
+    const secs = (typeof data.unload_seconds === 'number' && data.unload_seconds > 0)
+      ? ` in ${data.unload_seconds.toFixed(1)}s` : '';
+    setModelStatus(`Unloaded ${name}${secs}`, 'muted');
   } catch (err) {
+    stopLoadTicker();
     setModelStatus(`Failed to unload ${name}: ${err.message}`, 'error');
   } finally {
+    stopLoadTicker();
+    setModelLoadBar(null);
     _modelBusy = false;
     await refreshCatalog();
     if (typeof updateSelectedModelVisionState === 'function') updateSelectedModelVisionState();
@@ -4839,7 +4852,7 @@ function updateTtsEngineIndicator(engine, voice) {
 //
 // Server-side polling still runs and wins whenever it does answer (a short load,
 // or an ASR warm-up, where the process is responsive); this only fills the gap.
-function startLoadTicker(name, estimateS, stagesTotal) {
+function startLoadTicker(name, estimateS, stagesTotal, verb = 'Loading') {
   stopLoadTicker();
   _lastServerLoadUpdate = 0;
   const started = Date.now();
@@ -4859,7 +4872,7 @@ function startLoadTicker(name, estimateS, stagesTotal) {
       const remain = Math.max(0, est - elapsed);
       parts.push(remain > 0 ? `~${fmtDuration(Math.round(remain))} left` : 'finishing…');
     }
-    setModelStatus(`Loading ${name} · ${parts.join(' · ')}`, 'loading');
+    setModelStatus(`${verb} ${name} · ${parts.join(' · ')}`, 'loading');
     setModelLoadBar(pct != null ? pct : 'active');
   };
   tick();
@@ -5295,6 +5308,12 @@ let _logLineCount = 0;
 function applyLoadingStatus(ld, name) {
   if (!ld || ld.name !== name) return;
   _lastServerLoadUpdate = Date.now();
+  // Making room for the new model comes first; say which model is going.
+  if (ld.phase === 'unloading') {
+    setModelStatus(`Unloading ${ld.victim || 'a model'} to make room for ${name} · ${fmtDuration(ld.elapsedS)}`, 'loading');
+    setModelLoadBar('active');
+    return;
+  }
   const parts = [];
   // Percent first — it is what the eye goes to. `estimated` says whether it is
   // derived from counted stages or from elapsed-vs-expected time.

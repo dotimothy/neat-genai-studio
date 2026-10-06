@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
+import unittest.mock
 from pathlib import Path
 
 CLI_MAIN = Path(__file__).resolve().parents[2] / "src" / "python" / "cli" / "main.py"
@@ -216,6 +217,33 @@ class LiveStatusLineTests(unittest.TestCase):
         self.assertIn("finishing…", done)
         counted = cli._load_progress_line({"pct": 10, "filesDone": 4, "filesTotal": 40})
         self.assertIn("stage 4/40", counted)
+
+    def test_unload_line_fills_against_a_measured_time_or_sweeps(self):
+        timed = cli._unload_progress_line("model-a", 4.0, 1.0)
+        self.assertIn("25%", timed)
+        self.assertIn("unloading model-a", timed)
+        self.assertIn("~3s left", timed)
+        late = cli._unload_progress_line("model-a", 4.0, 9.0)
+        self.assertIn("99%", late)                      # never claims to be finished
+        self.assertIn("finishing…", late)
+        unknown = cli._unload_progress_line("model-a", None, 2.0)
+        self.assertNotIn("%", unknown)
+        self.assertNotIn("left", unknown)
+        self.assertIn("unloading model-a", unknown)
+        self.assertIn("2s", unknown)
+
+    def test_load_victims_are_the_least_recently_used_beyond_the_limit(self):
+        status = {"resident": ["b", "a"], "maxResident": 2,
+                  "catalog": [{"name": "a", "estimatedUnloadS": 1.5}, {"name": "b"}]}
+        with unittest.mock.patch.object(cli, "ctrl_get", return_value=status):
+            self.assertEqual(cli._load_victims(None, "c"), [("a", 1.5)])
+            self.assertEqual(cli._load_victims(None, "a"), [])      # already loaded
+        with unittest.mock.patch.object(cli, "ctrl_get", return_value=dict(status, maxResident=3)):
+            self.assertEqual(cli._load_victims(None, "c"), [])      # there is room
+        with unittest.mock.patch.object(cli, "ctrl_get", return_value=dict(status, maxResident=1)):
+            self.assertEqual(cli._load_victims(None, "c"), [("b", None), ("a", 1.5)])
+        with unittest.mock.patch.object(cli, "ctrl_get", side_effect=OSError("down")):
+            self.assertEqual(cli._load_victims(None, "c"), [])
 
     def test_nothing_is_animated_when_output_is_not_a_terminal(self):
         calls = []

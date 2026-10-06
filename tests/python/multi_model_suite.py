@@ -165,6 +165,81 @@ class ResidentLimitTests(ModelDirsCase):
         self.assertEqual(status["maxResidentLimit"], MAX_RESIDENT_LIMIT)
 
 
+class UnloadTimingTests(ModelDirsCase):
+    """Unloads are timed so clients can show progress for the next one."""
+
+    def setUp(self):
+        super().setUp()
+        (self.tmp / "model-a" / "elf_files" / "stage0_mla.elf").write_bytes(b"x" * 2_000_000)
+        (self.tmp / "model-b" / "elf_files" / "stage0_mla.elf").write_bytes(b"x" * 1_000_000)
+
+    def entry(self, manager, name):
+        return next(e for e in manager.catalog() if e["name"] == name)
+
+    def clock(self, *ticks):
+        """Patch the manager's clock to step through `ticks`, then hold."""
+        values = list(ticks)
+        return patch("server.model_manager.time.monotonic",
+                     side_effect=lambda: values.pop(0) if len(values) > 1 else values[0])
+
+    def test_there_is_no_estimate_before_anything_was_unloaded(self):
+        manager, _ = self.manager(2)
+        manager.load("model-a")
+        self.assertIsNone(self.entry(manager, "model-a")["estimatedUnloadS"])
+
+    def test_an_unload_reports_its_duration_and_becomes_the_estimate(self):
+        manager, _ = self.manager(2)
+        manager.load("model-a")
+        with self.clock(100.0, 100.0, 104.0, 104.0):   # unload start, removal start/end, end
+            result = manager.unload("model-a")
+        self.assertEqual(result["state"], "unloaded")
+        self.assertEqual(result["unload_seconds"], 4.0)
+        self.assertEqual(self.entry(manager, "model-a")["estimatedUnloadS"], 4.0)
+
+    def test_other_models_are_estimated_from_the_learned_rate(self):
+        manager, _ = self.manager(2)
+        manager.load("model-a")
+        with self.clock(100.0, 100.0, 104.0, 104.0):   # 2 MB took 4 s
+            manager.unload("model-a")
+        # model-b is half the size and has never been unloaded itself.
+        self.assertAlmostEqual(self.entry(manager, "model-b")["estimatedUnloadS"], 2.0)
+
+    def test_evicting_during_a_load_is_timed_too(self):
+        manager, _ = self.manager(1)
+        manager.load("model-a")
+        manager.load("model-b")                        # pushes model-a out
+        self.assertIsNotNone(self.entry(manager, "model-a")["estimatedUnloadS"])
+
+    def test_a_model_that_was_not_loaded_teaches_nothing(self):
+        manager, _ = self.manager(2)
+        result = manager.unload("model-a")
+        self.assertEqual(result["state"], "absent")
+        self.assertIsNone(self.entry(manager, "model-a")["estimatedUnloadS"])
+
+    def test_a_load_reports_which_model_it_is_unloading_first(self):
+        manager, server = self.manager(1)
+        manager.load("model-a")
+        seen = []
+        real_remove = server.remove_model
+
+        def remove(name):
+            seen.append(manager.loading_status())
+            return real_remove(name)
+
+        real_add = server.add_model
+
+        def add(path, name):
+            seen.append(manager.loading_status())
+            return real_add(path, name)
+
+        with patch.object(server, "remove_model", side_effect=remove), \
+                patch.object(server, "add_model", side_effect=add):
+            manager.load("model-b")
+        self.assertEqual([(s["phase"], s["victim"]) for s in seen],
+                         [("unloading", "model-a"), ("loading", None)])
+        self.assertIsNone(manager.loading_status())
+
+
 class MlaMemoryTests(ModelDirsCase):
     """Accelerator memory: pool size from the device tree, usage estimated
     from the ELF stages of the models this server has loaded."""

@@ -300,6 +300,11 @@ class ModelManager:
         # so we expose elapsed time + a learned ETA from weight size / past loads.
         self._loading: dict | None = None
         self._load_history: dict[str, float] = {}  # name -> last load seconds
+        # The same for unloads, so they can show progress too. No seed: nothing
+        # has been measured until the first unload, and a guess would be a bar
+        # that lies; until then clients show an open-ended one.
+        self._unload_history: dict[str, float] = {}
+        self._unload_sec_per_gb: float | None = None
         self._sec_per_gb: float | None = _DEFAULT_SEC_PER_GB   # learned rate for ETA
         # Optional stdout tap: real per-ELF load progress + a live loading log.
         self._log_tap = log_tap
@@ -416,6 +421,10 @@ class ModelManager:
                 "estimatedLoadS": self._estimate_load_seconds(
                     info["name"], self._elf_bytes(path) or self._size_of(path)),
                 "stagesTotal": self._count_elf_stages(path),
+                # Expected unload time, once the board has timed an unload
+                # (None before that).
+                "estimatedUnloadS": self._estimate_unload_seconds(
+                    info["name"], self._elf_bytes(path)),
                 "complete": complete,
                 "incompleteReason": reason or None,
                 # Distinct from "complete": an unsupported build downloaded
@@ -569,8 +578,7 @@ class ModelManager:
                 self._max_resident = limit
                 victims = self._resident[limit:]
             for victim in victims:
-                self._stop_model_streams(victim)
-                if not self._server.remove_model(victim):
+                if not self._unload_timed(victim):
                     raise RuntimeError(
                         f"Could not unload '{victim}' to honour the new limit: "
                         "the runtime reported it was not removed"
@@ -688,6 +696,8 @@ class ModelManager:
             self._last_error = None
             self._loading = {
                 "name": name,
+                "phase": "loading",
+                "victim": None,
                 "startedAt": started,
                 "estTotalS": self._estimate_load_seconds(name, load_bytes),
                 # Real progress: count completed ELF-stage loads (from the
@@ -709,12 +719,13 @@ class ModelManager:
                 # holding _lock so status polls stay responsive during the switch.
                 for victim in victims:
                     self._log_note(f"Unloading {victim}")
-                    self._stop_model_streams(victim)
+                    # Say what the wait is for, for clients that can reach us.
+                    self._loading.update(phase="unloading", victim=victim)
                     try:
                         # remove_model reports a model it did not remove by
                         # returning False rather than raising; treat that the
                         # same way unload() does — as authoritative.
-                        if not self._server.remove_model(victim):
+                        if not self._unload_timed(victim):
                             raise RuntimeError("the runtime reported it was not removed")
                         evicted.append(victim)
                         with self._lock:
@@ -742,6 +753,7 @@ class ModelManager:
                 if evicted and self._switch_settle_s:
                     time.sleep(self._switch_settle_s)
 
+                self._loading.update(phase="loading", victim=None)
                 # add_model returns the name the server actually served it under,
                 # which may differ from the requested one — that is the truth.
                 self._log_note(f"Registering {name} with the runtime…")
@@ -917,6 +929,35 @@ class ModelManager:
             rate = seconds / (size_bytes / 1e9)
             self._sec_per_gb = rate if self._sec_per_gb is None else 0.5 * self._sec_per_gb + 0.5 * rate
 
+    def _estimate_unload_seconds(self, name: str, size_bytes: int | None) -> float | None:
+        """Best-effort unload time: the model's own last one, else a learned rate."""
+        if name in self._unload_history:
+            return self._unload_history[name]
+        if self._unload_sec_per_gb and size_bytes:
+            return (size_bytes / 1e9) * self._unload_sec_per_gb
+        return None
+
+    def _unload_timed(self, name: str) -> bool:
+        """Cancel a model's streams and unload it, learning how long that takes.
+
+        Returns what ``remove_model`` reported. Both steps can block for
+        seconds (an HTTP /stop, then the accelerator free), so call it without
+        holding ``_lock``.
+        """
+        size_bytes = self._elf_bytes(self.resolved_model_path(name))
+        started = time.monotonic()
+        self._stop_model_streams(name)
+        removed = bool(self._server.remove_model(name))
+        seconds = time.monotonic() - started
+        if removed and seconds > 0:
+            self._unload_history[name] = seconds
+            if size_bytes:
+                rate = seconds / (size_bytes / 1e9)
+                self._unload_sec_per_gb = (
+                    rate if self._unload_sec_per_gb is None
+                    else 0.5 * self._unload_sec_per_gb + 0.5 * rate)
+        return removed
+
     def loading_status(self) -> dict | None:
         """Live progress for an in-flight load, or None.
 
@@ -949,6 +990,8 @@ class ModelManager:
                 estimated = True
             return {
                 "name": info["name"],
+                "phase": info.get("phase", "loading"),
+                "victim": info.get("victim"),
                 "elapsedS": round(elapsed, 1),
                 "etaS": round(eta_total, 1) if eta_total else None,
                 "remainingS": round(max(0.0, eta_total - elapsed), 1) if eta_total else None,
@@ -969,6 +1012,8 @@ class ModelManager:
         pct = int(min(99, elapsed / est * 100)) if est and est > 0 else None
         return {
             "name": info["name"],
+            "phase": info.get("phase", "loading"),
+            "victim": info.get("victim"),
             "elapsedS": round(elapsed, 1),
             "etaS": round(est, 1) if est else None,
             "remainingS": round(max(0.0, est - elapsed), 1) if est else None,
@@ -1270,12 +1315,13 @@ class ModelManager:
             self._refuse_if_active_asr(name, "unloaded")
             # remove_model frees MLA memory and can block for seconds — keep it
             # out of _lock so concurrent status polls are not held up.
-            self._stop_model_streams(name)
-            removed = bool(self._server.remove_model(name))
+            started = time.monotonic()
+            removed = self._unload_timed(name)
             with self._lock:
                 if name in self._resident:
                     self._resident.remove(name)
-        return {"name": name, "state": "unloaded" if removed else "absent"}
+        return {"name": name, "state": "unloaded" if removed else "absent",
+                "unload_seconds": round(time.monotonic() - started, 1)}
 
     def delete(self, name: str) -> dict:
         """Unload (if loaded) and delete a model's files from the catalog.

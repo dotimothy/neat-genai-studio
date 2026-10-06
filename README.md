@@ -290,8 +290,11 @@ Anything the CLI waits on is drawn as one moving status line, so a long wait
 never looks like a hang: a spinner with a running timer while it connects to
 the model server, starts the RAG service, waits out an accelerator reset or
 waits for the first token of a reply, and a progress bar for model loads
-(percentage, stage count, elapsed time and an estimated time left), downloads
-(size, transfer rate and time left) and benchmarks. The animation is drawn
+(percentage, stage count, elapsed time and an estimated time left), unloads,
+downloads (size, transfer rate and time left) and benchmarks. An unload bar
+fills against that model's measured unload time once the board has timed one;
+before that it sweeps, because there is nothing to measure against yet. The
+web UI's Load status bar does the same for **Unload**. The animation is drawn
 only on a real terminal; with output redirected to a file or a pipe the CLI
 prints plain lines instead.
 
