@@ -481,6 +481,8 @@ POST /v1/audio/translations        speech to English text
 GET  /models/status, /models/catalog; POST /models/load, /models/unload, /models/asr, ...
 POST /models/max-resident {"limit": n}   how many chat/VLM models stay loaded together
 POST /models/active {"name": "..."}      mark a loaded model most recently used (evicted last)
+POST /compare/stream {"turn", "model"}   one model's streamed answer to a side-by-side turn (the web UI's Compare)
+POST /compare/choose {"turn", "answer"}  record which answer the conversation continues from
 GET/POST /tts/engine; GET /supertonic/voices, /piperplus/voices, /voices; POST /supertonic/select, /piperplus/select, /voices/select   voice settings
 POST /shutdown                     stop everything (not reachable cross-origin)
 ```
@@ -562,11 +564,17 @@ With two or more loaded:
   is tagged with the model that wrote it. Images from earlier turns are left out
   of requests to a text-only model and sent again when you switch back.
 - **Compare side by side.** The two-column button in the header (also in the
-  model menu) opens **Compare**: type one prompt and every loaded model answers
-  in its own column at the same time, each with its first-token time, tokens
-  per second, token count and total time, plus the combined rate. Untick
-  **Run at the same time** to run them one after another instead. Comparisons
-  are sent without the chat history or system prompt and do not touch the chat.
+  model menu) switches **Compare** on. While it is on, every message you send,
+  typed or spoken, with or without an image, is answered by all loaded models
+  at the same time, each in its own card in the conversation with its token
+  count, tokens per second, first-token time and total time, plus the combined
+  rate for the turn. The conversation carries on from the answer of the model
+  you are chatting with; press **Continue with this answer** on another card to
+  carry on from that one instead, which also makes its model the one you chat
+  with. Every model sees the same conversation so far, including RAG context
+  when that is on. A text-only model is not sent the image (its card says so),
+  and comparison answers are shown, not spoken. Switch Compare off to go back
+  to single replies in the same conversation.
 - **Use them from the API.** Every loaded model is served by the
   OpenAI-compatible endpoint at once; name the one you want in `model`, and
   send requests to different models in parallel.

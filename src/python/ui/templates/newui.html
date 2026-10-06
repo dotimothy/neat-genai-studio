@@ -73,7 +73,8 @@
             <path d="M12 2l8 3.2V11c0 5-3.4 8.9-8 11-4.6-2.1-8-6-8-11V5.2L12 2z" fill="url(#slMark)"/></svg>
         </a>
         <button id="compareButton" class="header-icon-btn" type="button" style="display: none;"
-          title="Compare loaded models side by side" aria-label="Compare loaded models side by side">
+          title="Compare: have every loaded model answer side by side" aria-pressed="false"
+          aria-label="Compare: have every loaded model answer side by side">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2"
             stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="7.5" height="16" rx="1.5"/><rect x="13.5" y="4" width="7.5" height="16" rx="1.5"/></svg>
         </button>
@@ -738,37 +739,6 @@
   <!-- Active-model menu: opened from the header pill or the home indicator
        when more than one chat/VLM model is loaded. -->
   <div id="activeModelMenu" class="active-model-menu" role="menu" aria-label="Choose the model to chat with" hidden></div>
-
-  <div id="compareModal" class="bench-modal compare-modal" style="display: none;" role="dialog" aria-modal="true" aria-label="Compare loaded models">
-    <div class="bench-topbar">
-      <img class="fs-brand-mark" src="{{ url_for('static', filename='icons/neat-mark.png') }}" alt="Neat">
-      <span class="bench-title"><span class="bench-dot"></span>Compare<span class="bench-kicker">loaded models · side by side</span></span>
-      <div class="bench-top-actions">
-        <button id="compareCloseBtn" class="bench-top-btn bench-close" type="button" title="Close (Esc)" aria-label="Close">✕</button>
-      </div>
-    </div>
-    <div class="bench-body compare-body">
-      <div class="bench-config compare-config">
-        <div class="bench-field bench-field-grow compare-prompt-field">
-          <label for="comparePrompt">Prompt</label>
-          <textarea id="comparePrompt" rows="2" placeholder="Ask every loaded model the same question (Ctrl/⌘ + Enter to run)"></textarea>
-        </div>
-        <div class="bench-field">
-          <label for="compareMaxTokens">Output tokens</label>
-          <input type="number" id="compareMaxTokens" min="8" max="2048" step="8" value="256">
-        </div>
-        <label class="compare-parallel" title="Off: run the models one after another instead">
-          <input type="checkbox" id="compareParallel" checked><span>Run at the same time</span>
-        </label>
-        <button id="compareRunBtn" class="bench-run-btn" type="button">Run</button>
-        <button id="compareStopBtn" class="bench-stop-btn" type="button" style="display: none;">Stop</button>
-      </div>
-      <div id="compareSummary" class="compare-summary" aria-live="polite"></div>
-      <div id="compareEmpty" class="hub-note compare-empty">Load two or more models to compare them. Raise <b>Keep loaded</b> under Settings → Models, then load a second model.</div>
-      <div id="compareGrid" class="compare-grid"></div>
-      <div class="hub-note compare-foot">Each model gets the prompt on its own, without the chat history or system prompt. First token and total are wall-clock times from the moment you press Run; tok/s is the runtime's own figure when it reports one.</div>
-    </div>
-  </div>
 
   <div id="benchmarkModal" class="bench-modal" style="display: none;" role="dialog" aria-modal="true" aria-label="Performance benchmark">
     <div class="bench-topbar">

@@ -1146,6 +1146,10 @@ class AppContext:
                                     orgs=("simaai", "TDoSiMa", "florianvoss"))
         self.ui_font_family = "Inter"
         self.ui_font_size = 15
+        # Side-by-side turns: the request every loaded model is answering, kept
+        # until the conversation moves on so the chosen answer can be recorded.
+        self._compare_turns = {}
+        self._compare_counter = 0
         self._catalog_names_cache = (0.0, frozenset())
         # Vision support per catalog model, refreshed with the names above.
         self._catalog_vision = {}
@@ -1237,6 +1241,62 @@ class AppContext:
         self.current_response = ""
         logging.info(f"Added assistant response to history. Total messages: {len(self.conversation_history)}")
         return True
+
+    def begin_compare_turn(self, messages, models, gen_params):
+        """Register a side-by-side turn; call right after add_user_message()."""
+        with self._state_lock:
+            self._compare_counter += 1
+            turn_id = f"c{self._compare_counter}"
+            self._compare_turns[turn_id] = {
+                "messages": messages,
+                "models": tuple(models),
+                "gen_params": dict(gen_params or {}),
+                # Identity of the turn's messages in the shared history: the
+                # way to tell later whether the conversation has moved on.
+                "user_msg": self.conversation_history[-1] if self.conversation_history else None,
+                "assistant_msg": None,
+            }
+            # Requests carry images; keep only the turns that can still be acted on.
+            for stale in list(self._compare_turns)[:-2]:
+                del self._compare_turns[stale]
+            return turn_id
+
+    def get_compare_turn(self, turn_id):
+        with self._state_lock:
+            return self._compare_turns.get(turn_id)
+
+    def choose_compare_answer(self, turn_id, answer):
+        """Record the answer the conversation continues from.
+
+        Returns 'recorded' (first choice), 'replaced' (a different answer was
+        picked for the same turn), 'dropped' (nothing was produced, so the
+        unanswered user message is taken back out) or 'stale' (the conversation
+        has moved on or was cleared; nothing changed).
+        """
+        answer = str(answer or '')
+        stored = _answer_part(answer).strip() or answer.strip()
+        content = stored if self.llm_only else [{"type": "text", "text": stored}]
+        with self._state_lock:
+            turn = self._compare_turns.get(turn_id)
+            history = self.conversation_history
+            if turn is None or not history:
+                return 'stale'
+            previous = turn["assistant_msg"]
+            if previous is not None:
+                if history[-1] is not previous or not stored:
+                    return 'stale'
+                previous["content"] = content
+                return 'replaced'
+            if turn["user_msg"] is None or history[-1] is not turn["user_msg"]:
+                return 'stale'
+            if not stored:
+                history.pop()
+                turn["user_msg"] = None
+                return 'dropped'
+            message = {"role": "assistant", "content": content}
+            history.append(message)
+            turn["assistant_msg"] = message
+            return 'recorded'
 
     def start_assistant_response(self, generation_id):
         """Start accumulating a new assistant response."""
@@ -2142,6 +2202,10 @@ class AppContext:
             if self.max_tokens:
                 payload.setdefault('max_tokens', int(self.max_tokens))
             _normalize_openai_image_parts(payload)
+            return _relay_chat_completion(payload)
+
+        def _relay_chat_completion(payload):
+            """Stream one chat completion from the model server to the browser."""
             url = f"http://{self.app.config['SIMAAI_IP_ADDR']}/v1/chat/completions"
             try:
                 upstream = requests.post(url, json=payload, stream=True, timeout=(10, 600))
@@ -2173,6 +2237,30 @@ class AppContext:
                 content_type=upstream.headers.get('Content-Type', 'text/event-stream'),
                 headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
             )
+
+        @self.app.route('/compare/stream', methods=['POST'])
+        def compare_stream():
+            # One model's answer to a side-by-side turn registered by /upload.
+            # The browser opens one of these per loaded model, so the requests
+            # are in flight together; each sees the same conversation so far.
+            body = request.get_json(silent=True) or {}
+            turn = self.get_compare_turn(str(body.get('turn', '')))
+            model = str(body.get('model', '')).strip()
+            if turn is None:
+                return jsonify({'error': 'This comparison is no longer available. Send the message again.'}), 404
+            if model not in turn['models']:
+                return jsonify({'error': 'That model is not part of this comparison.'}), 400
+            return _relay_chat_completion(_build_chat_payload(
+                turn['messages'], model, genai_app.get_config(), turn['gen_params']))
+
+        @self.app.route('/compare/choose', methods=['POST'])
+        def compare_choose():
+            # Which answer the conversation continues from (see
+            # choose_compare_answer for the possible results).
+            body = request.get_json(silent=True) or {}
+            result = self.choose_compare_answer(
+                str(body.get('turn', '')), body.get('answer', ''))
+            return jsonify({'result': result})
 
         @self.app.route('/stop', methods=['POST'])
         def stop_processing():
@@ -2239,6 +2327,16 @@ class AppContext:
                 selected_model = self.resolve_chat_model(request.form.get('chatModel'))
             except ValueError:
                 return jsonify({'error': 'Invalid chat model'}), 400
+            # Side-by-side turn: every listed model answers this message. The
+            # browser streams each answer itself (/compare/stream), so nothing
+            # is spoken and no single generation is started here.
+            try:
+                compare_models = _read_compare_models(
+                    request.form.get('compareModels'), self.resolve_chat_model)
+            except ValueError:
+                return jsonify({'error': 'Invalid comparison model list'}), 400
+            if compare_models:
+                enable_tts = False
 
             self.talk_ctrl.reset()
             initial_tts_language = (
@@ -2389,7 +2487,7 @@ class AppContext:
             # Add user message to conversation history (detect if image is present)
             has_image = image_base64 is not None
             self.add_user_message(full_query_str, has_image=has_image, image_base64=image_base64)
-            generation_id = self.begin_generation(selected_model)
+            generation_id = None if compare_models else self.begin_generation(selected_model)
 
             ttfs = 0
             logging.info(f"Query string: {full_query_str}")
@@ -2414,6 +2512,21 @@ class AppContext:
                             conversation_history.append(msg)
                             break
                 logging.info(f"Using single-shot mode (history disabled, {len(conversation_history)} messages)")
+
+            if compare_models:
+                turn_id = self.begin_compare_turn(conversation_history, compare_models, gen_params)
+                return jsonify({
+                    'question': query_str,
+                    'ttt': elapsed_time,
+                    'asr': asr,
+                    'rag_used': rag_used,
+                    'rag_hits': rag_hits,
+                    'compare': {
+                        'turn': turn_id,
+                        'models': compare_models,
+                        'hasImage': has_image,
+                    },
+                })
 
             thread = threading.Thread(
                 target=stream_chat_request,
@@ -3159,14 +3272,35 @@ def _strip_image_parts(messages):
     return stripped
 
 
-def stream_chat_request(messages, model, config, generation_id, socketio_event='update', gen_params=None):
+def _read_compare_models(raw, resolve):
+    """Models named for a side-by-side turn: a JSON list of two or more.
+
+    Returns [] when the field is absent (an ordinary turn). ``resolve`` checks
+    each name the way the chat model itself is checked and raises ValueError.
     """
-    Streams chat completions from backend to frontend, handling TTS and history.
-    """
+    if not raw:
+        return []
+    try:
+        names = json.loads(raw)
+    except (TypeError, ValueError):
+        raise ValueError("not a JSON list") from None
+    if not isinstance(names, list):
+        raise ValueError("not a JSON list")
+    models = []
+    for name in names:
+        model = resolve(str(name))
+        if model not in models:
+            models.append(model)
+    if len(models) < 2:
+        raise ValueError("a comparison needs at least two models")
+    return models
+
+
+def _build_chat_payload(messages, model, config, gen_params=None):
+    """The streaming chat-completions request for one model and one turn."""
     gen_params = gen_params or {}
     if genai_app is not None and not genai_app.model_supports_vision(model):
         messages = _strip_image_parts(messages)
-    url = f"http://{config['SIMAAI_IP_ADDR']}/v1/chat/completions"
     no_think = bool(gen_params.get('no_think'))
     payload = {
         "model": model,
@@ -3180,6 +3314,15 @@ def stream_chat_request(messages, model, config, generation_id, socketio_event='
     max_tokens = gen_params.get('max_tokens') or config.get('MAX_TOKENS')
     if max_tokens:
         payload["max_tokens"] = int(max_tokens)
+    return payload
+
+
+def stream_chat_request(messages, model, config, generation_id, socketio_event='update', gen_params=None):
+    """
+    Streams chat completions from backend to frontend, handling TTS and history.
+    """
+    url = f"http://{config['SIMAAI_IP_ADDR']}/v1/chat/completions"
+    payload = _build_chat_payload(messages, model, config, gen_params)
     _full_reply = ""   # accumulated content, to keep reasoning out of TTS
     _tts_spoken = 0    # length of the answer already sent to TTS
 

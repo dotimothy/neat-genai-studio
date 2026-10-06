@@ -1063,6 +1063,7 @@ async function stop(stopAudioFlag = false) {
   if (stopAudioFlag) {
     stopAudio();
   }
+  await abortCompareStreams();
 
   try {
     await fetch('/stop', { method: 'POST' });
@@ -1295,6 +1296,8 @@ function handleChatHistoryToggle(event) {
 
 // New Chat functionality
 function newChat() {
+  // A side-by-side turn in flight belongs to the chat being cleared.
+  abortCompareStreams();
   // Clear chat history
   clearChatHistory();
 
@@ -1682,7 +1685,11 @@ async function startProcessingInternal(resultMessage, textchat = null, waitForTr
   _lastRequestModel = getSelectedChatModel();
   formData.append('chatModel', _lastRequestModel);
   formData.append('utteranceSpeed', getUtteranceSpeed().toFixed(2));
-  formData.append('enableTts', isTtsEnabled());
+  // Compare mode: name every loaded model. Answers are shown, not spoken.
+  const compareModels = compareTargets();
+  if (compareModels.length) formData.append('compareModels', JSON.stringify(compareModels));
+  retireComparePicks();
+  formData.append('enableTts', compareModels.length ? false : isTtsEnabled());
   formData.append('maxTokens', getMaxTokens());
   formData.append('noThink', !getThinkingEnabled());   // disable reasoning when the toggle is off
 
@@ -1715,6 +1722,9 @@ async function startProcessingInternal(resultMessage, textchat = null, waitForTr
           ? `RAG used: yes, hits: ${data.rag_hits || 0}`
           : "RAG used: no";
       }
+      // A side-by-side turn streams on its own. Not awaited, so Stop or a new
+      // message can interrupt it like any other reply.
+      if (data.compare && Array.isArray(data.compare.models)) runCompareTurn(data.compare);
     } catch (error) {
       activeGeneration = false;
       console.error('Error uploading files:', error);
@@ -4269,8 +4279,8 @@ function openActiveModelMenu(anchor) {
   foot.className = 'active-model-menu-foot';
   const compare = document.createElement('button');
   compare.type = 'button'; compare.className = 'active-model-link';
-  compare.textContent = 'Compare side by side';
-  compare.addEventListener('click', () => { closeActiveModelMenu(); openCompare(); });
+  compare.textContent = _compareMode ? 'Stop comparing' : 'Compare side by side';
+  compare.addEventListener('click', () => { closeActiveModelMenu(); setCompareMode(!_compareMode); });
   const manage = document.createElement('button');
   manage.type = 'button'; manage.className = 'active-model-link';
   manage.textContent = 'Manage models…';
@@ -4523,7 +4533,8 @@ function updateActiveModelPill() {
   }
   const compareBtn = document.getElementById('compareButton');
   if (compareBtn) compareBtn.style.display = others > 0 ? '' : 'none';
-  if (others === 0) closeActiveModelMenu();
+  if (others === 0) { closeActiveModelMenu(); _compareMode = false; }
+  syncCompareUi();
   updateHomeModelIndicator();
 }
 
@@ -4537,8 +4548,9 @@ function updateHomeModelIndicator() {
   if (model) {
     const vision = typeof selectedChatModelSupportsVision === 'function' && selectedChatModelSupportsVision();
     const others = Math.max(0, loadedChatModels().length - 1);
-    nameEl.textContent = model + (vision ? '  ·  vision' : '')
-      + (others > 0 ? `  ·  +${others} loaded` : '');
+    nameEl.textContent = _compareMode
+      ? `Comparing ${others + 1} models side by side`
+      : model + (vision ? '  ·  vision' : '') + (others > 0 ? `  ·  +${others} loaded` : '');
     box.classList.add('loaded');
     box.classList.remove('empty');
     box.title = others > 0 ? 'Active model — click to switch' : 'Active model — click to change';
@@ -4586,7 +4598,7 @@ function updateComposerEnabled() {
   const composer = document.getElementById('chatInput');
   if (input) {
     input.disabled = !ready;
-    input.placeholder = ready ? 'Message'
+    input.placeholder = ready ? (_compareMode ? `Message all ${loadedChatModels().length} loaded models` : 'Message')
       : (_modelBusy ? 'Loading model — please wait…'
         : 'Load a model in Settings to start chatting…');
   }
@@ -6857,145 +6869,141 @@ function initBenchmark() {
   });
 }
 
-// ---- Compare: one prompt, every loaded model, side by side -------------
-// Each loaded chat/VLM model gets its own column and its own streamed request
-// through the same-origin /v1/chat/completions proxy, so the requests really
-// are in flight together. Nothing here touches the chat, its history or TTS.
-let _compareRunning = false;
-let _compareControllers = [];
-const _compareResults = {};   // model name -> { text, stats, state } of the last run
+// ---- Compare mode: every loaded model answers, side by side, in the chat ----
+// With Compare on, a message goes to all loaded chat/VLM models at once. The
+// normal /upload request still does the preparation (image, voice
+// transcription, RAG, history) and registers the turn; each model's answer is
+// then streamed from /compare/stream into its own card in the transcript. One
+// answer is recorded as the conversation's reply (the active model's by
+// default, or the one the user picks), so the chat carries on from it.
+let _compareMode = false;
+let _compareActiveTurn = null;   // the turn whose streams are in flight
 
 function initCompare() {
-  const modal = document.getElementById('compareModal');
-  if (!modal) return;
-  const open = document.getElementById('compareButton');
-  const close = document.getElementById('compareCloseBtn');
-  const run = document.getElementById('compareRunBtn');
-  const stop = document.getElementById('compareStopBtn');
-  const prompt = document.getElementById('comparePrompt');
-  if (open) open.addEventListener('click', openCompare);
-  if (close) close.addEventListener('click', closeCompare);
-  if (run) run.addEventListener('click', runCompare);
-  if (stop) stop.addEventListener('click', stopCompare);
-  if (prompt) prompt.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runCompare(); }
-  });
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && modal.style.display === 'flex') closeCompare();
-  });
+  const btn = document.getElementById('compareButton');
+  if (btn) btn.addEventListener('click', () => setCompareMode(!_compareMode));
+  syncCompareUi();
 }
 
-function openCompare() {
-  const modal = document.getElementById('compareModal');
-  if (!modal) return;
-  modal.style.display = 'flex';
-  document.body.classList.add('bench-open');
-  renderCompareColumns();
-  const prompt = document.getElementById('comparePrompt');
-  if (prompt) prompt.focus();
+// The models a message goes to right now: all loaded ones while Compare is on
+// (active model first), otherwise none, i.e. an ordinary single-model turn.
+function compareTargets() {
+  if (!_compareMode) return [];
+  if (typeof isVisionOpen === 'function' && isVisionOpen()) return [];
+  const active = getSelectedChatModel();
+  const names = loadedChatModels().map(m => m.name);
+  if (names.length < 2) return [];
+  return names.sort((x, y) => (y === active) - (x === active));
 }
 
-function closeCompare() {
-  const modal = document.getElementById('compareModal');
-  if (!modal) return;
-  stopCompare();
-  modal.style.display = 'none';
-  document.body.classList.remove('bench-open');
+function setCompareMode(on) {
+  _compareMode = !!on && loadedChatModels().length >= 2;
+  syncCompareUi();
+  updateComposerEnabled();
+  updateHomeModelIndicator();
+}
+
+function syncCompareUi() {
+  const btn = document.getElementById('compareButton');
+  if (btn) {
+    btn.classList.toggle('is-on', _compareMode);
+    btn.setAttribute('aria-pressed', _compareMode ? 'true' : 'false');
+    btn.title = _compareMode
+      ? 'Compare is on: every loaded model answers side by side. Click to turn off.'
+      : 'Compare: have every loaded model answer side by side';
+  }
+  document.body.classList.toggle('compare-mode', _compareMode);
 }
 
 function compareFmt(n, digits) {
   return Number.isFinite(n) ? n.toFixed(digits) : '—';
 }
 
-function compareSetStats(col, stats) {
-  const set = (k, v) => { const el = col.querySelector(`[data-k="${k}"]`); if (el) el.textContent = v; };
-  set('ttft', stats.ttftS != null ? `${compareFmt(stats.ttftS, 2)}s` : '—');
-  set('tps', stats.tps != null ? compareFmt(stats.tps, 1) : '—');
-  set('tokens', String(stats.tokens || 0));
-  set('time', stats.totalS != null ? `${compareFmt(stats.totalS, 1)}s` : '—');
+function compareStatsText(c) {
+  const parts = [];
+  if (c.tokens) parts.push(`${c.tokens} token${c.tokens === 1 ? '' : 's'}`);
+  if (c.tps != null) parts.push(`${compareFmt(c.tps, 1)} tok/s`);
+  if (c.ttftS != null) parts.push(`first token ${compareFmt(c.ttftS, 2)}s`);
+  if (c.totalS != null) parts.push(`${compareFmt(c.totalS, 1)}s`);
+  return parts.join(' · ');
 }
 
-function compareSetState(col, text, kind) {
-  const el = col.querySelector('.compare-col-state');
-  if (!el) return;
-  el.textContent = text || '';
-  el.className = 'compare-col-state' + (kind ? ` is-${kind}` : '');
+function compareSetState(c, text, kind) {
+  c.stateEl.textContent = text || '';
+  c.stateEl.className = 'compare-col-state' + (kind ? ` is-${kind}` : '');
 }
 
-// One column per loaded model. Rebuilt whenever the view opens or a run starts,
-// so it always reflects what is loaded now; a model's last answer is kept.
-function renderCompareColumns() {
-  const grid = document.getElementById('compareGrid');
-  const empty = document.getElementById('compareEmpty');
-  const run = document.getElementById('compareRunBtn');
-  if (!grid) return [];
-  const models = loadedChatModels();
-  grid.innerHTML = '';
-  grid.style.setProperty('--compare-cols', String(Math.max(1, Math.min(models.length, 4))));
-  if (empty) empty.style.display = models.length >= 2 ? 'none' : '';
-  if (run) run.disabled = _compareRunning || models.length < 1;
-  return models.map(m => {
+// Build the side-by-side block and put it where the "Processing..." placeholder is.
+function buildCompareBlock(info) {
+  const block = document.createElement('div');
+  block.className = 'message compare-turn';
+  block.dataset.turn = info.turn;
+  const head = document.createElement('div');
+  head.className = 'compare-turn-head';
+  head.innerHTML = `<span class="compare-turn-title">Side by side · ${info.models.length} models</span>`
+    + '<span class="compare-turn-summary"></span>';
+  const grid = document.createElement('div');
+  grid.className = 'compare-grid';
+  block.appendChild(head);
+  block.appendChild(grid);
+  const cols = info.models.map(model => {
+    const entry = _catalog.find(m => m.name === model) || { name: model };
+    const kind = modelKindLabel(entry);
     const col = document.createElement('div');
     col.className = 'compare-col';
-    col.dataset.model = m.name;
-    const kind = modelKindLabel(m);
-    col.innerHTML = `<div class="compare-col-head">`
-      + `<span class="compare-col-name" title="${escHtml(m.name)}">${escHtml(m.name)}</span>`
+    col.dataset.model = model;
+    col.innerHTML = '<div class="compare-col-head">'
+      + `<span class="compare-col-name" title="${escHtml(model)}">${escHtml(model)}</span>`
       + `<span class="hub-badge hub-badge-${kind.toLowerCase()}">${kind}</span></div>`
-      + `<div class="compare-col-stats">`
-      + `<span><b data-k="ttft">—</b>first token</span>`
-      + `<span><b data-k="tps">—</b>tok/s</span>`
-      + `<span><b data-k="tokens">0</b>tokens</span>`
-      + `<span><b data-k="time">—</b>total</span></div>`
-      + `<div class="compare-col-body message-text"></div>`
-      + `<div class="compare-col-state"></div>`;
+      + (info.hasImage && kind === 'LLM'
+        ? '<div class="compare-col-note">Text-only model: the image was not sent to it.</div>' : '')
+      + '<div class="compare-col-body message-text"></div>'
+      + '<div class="compare-col-foot"><span class="compare-col-stats"></span>'
+      + '<span class="compare-col-state"></span></div>';
     grid.appendChild(col);
-    const prev = _compareResults[m.name];
-    if (prev) {
-      renderMarkdownInto(col.querySelector('.compare-col-body'), prev.text);
-      compareSetStats(col, prev.stats);
-      compareSetState(col, prev.stateText, prev.stateKind);
-    }
-    return { model: m.name, col };
+    return {
+      model, col, text: '', tokens: 0, tps: null, ttftS: null, totalS: null,
+      bodyEl: col.querySelector('.compare-col-body'),
+      statsEl: col.querySelector('.compare-col-stats'),
+      stateEl: col.querySelector('.compare-col-state'),
+    };
   });
+  const assistants = chatMessages.querySelectorAll('.message.assistant.streaming-text');
+  const placeholder = assistants[assistants.length - 1];
+  if (placeholder && placeholder === chatMessages.lastElementChild) placeholder.replaceWith(block);
+  else chatMessages.appendChild(block);
+  scrollChatToBottom();
+  return { block, cols, summaryEl: head.querySelector('.compare-turn-summary') };
 }
 
-// Stream one model's answer into its column. First token and total are wall
-// clock from `t0` (so a request that had to wait its turn shows it); tok/s is
+// Stream one model's answer into its card. First token and total are wall
+// clock from `t0`, so a request that had to wait its turn shows it; tok/s is
 // the runtime's own figure when it streams one, else derived from arrivals.
-async function compareRunOne(entry, prompt, maxTokens, t0) {
-  const { model, col } = entry;
-  const body = col.querySelector('.compare-col-body');
+async function compareStreamOne(ctx, c, t0) {
   const controller = new AbortController();
-  _compareControllers.push(controller);
-  const stats = { ttftS: null, tps: null, tokens: 0, totalS: null };
-  let text = '';
+  ctx.controllers.push(controller);
   let tFirst = null;
   let tLast = null;
   let srvTps = null;
-  const finish = (stateText, stateKind) => {
-    stats.totalS = (performance.now() - t0) / 1000;
-    if (srvTps != null) stats.tps = srvTps;
-    else if (tFirst != null && tLast > tFirst && stats.tokens > 1) {
-      stats.tps = (stats.tokens - 1) / ((tLast - tFirst) / 1000);
-    }
-    compareSetStats(col, stats);
-    compareSetState(col, stateText, stateKind);
-    renderMarkdownInto(body, text);
-    _compareResults[model] = { text, stats, stateText, stateKind };
+  const settle = (stateText, stateKind) => {
+    c.totalS = (performance.now() - t0) / 1000;
+    if (srvTps != null) c.tps = srvTps;
+    else if (tFirst != null && tLast > tFirst && c.tokens > 1) c.tps = (c.tokens - 1) / ((tLast - tFirst) / 1000);
+    c.statsEl.textContent = compareStatsText(c);
+    compareSetState(c, stateText, stateKind);
+    // Cancel a pending throttled render first, or it fires next frame and
+    // re-renders without the highlighting / copy buttons.
+    cancelPendingRender(c.bodyEl);
+    renderMarkdownInto(c.bodyEl, splitThinking(c.text).answer);
+    c.col.classList.remove('is-running');
   };
-  body.innerHTML = '';
-  compareSetStats(col, stats);
-  compareSetState(col, 'Waiting for the first token…', 'busy');
-  col.classList.add('is-running');
+  compareSetState(c, 'Waiting for the first token…', 'busy');
+  c.col.classList.add('is-running');
   try {
-    const resp = await fetch('/v1/chat/completions', {
+    const resp = await fetch('/compare/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model, stream: true, max_tokens: maxTokens,
-        messages: [{ role: 'user', content: prompt }],
-      }),
+      body: JSON.stringify({ turn: ctx.turn, model: c.model }),
       signal: controller.signal,
     });
     if (!resp.ok || !resp.body) {
@@ -7026,79 +7034,122 @@ async function compareRunOne(entry, prompt, maxTokens, t0) {
         const delta = obj.choices && obj.choices[0] && obj.choices[0].delta && obj.choices[0].delta.content;
         if (!delta) continue;
         const now = performance.now();
-        if (tFirst == null) {
-          tFirst = now;
-          stats.ttftS = (now - t0) / 1000;
-          compareSetState(col, 'Generating…', 'busy');
-        }
+        if (tFirst == null) { tFirst = now; c.ttftS = (now - t0) / 1000; }
         tLast = now;
-        stats.tokens += 1;
-        text += delta;
-        stats.totalS = (now - t0) / 1000;
-        if (srvTps != null) stats.tps = srvTps;
-        else if (stats.tokens > 1 && tLast > tFirst) stats.tps = (stats.tokens - 1) / ((tLast - tFirst) / 1000);
-        compareSetStats(col, stats);
-        renderMarkdownStreaming(body, text);
-        body.scrollTop = body.scrollHeight;
+        c.tokens += 1;
+        c.text += delta;
+        const parts = splitThinking(c.text);
+        compareSetState(c, parts.present && !parts.closed ? 'Thinking…' : 'Generating…', 'busy');
+        if (srvTps != null) c.tps = srvTps;
+        c.statsEl.textContent = compareStatsText(c);
+        setMarkdownThrottled(c.bodyEl, parts.answer);
       }
     }
-    finish(stats.tokens ? 'Done' : 'No output', stats.tokens ? 'ok' : 'error');
+    settle(c.tokens ? '' : 'No output', c.tokens ? '' : 'error');
   } catch (err) {
-    if (err && err.name === 'AbortError') finish('Stopped', 'muted');
-    else finish(`Failed: ${err && err.message ? err.message : err}`, 'error');
-  } finally {
-    col.classList.remove('is-running');
+    if (err && err.name === 'AbortError') { c.stopped = true; settle('Stopped', 'muted'); }
+    else settle(`Failed: ${err && err.message ? err.message : err}`, 'error');
   }
 }
 
-async function runCompare() {
-  if (_compareRunning) return;
-  const promptEl = document.getElementById('comparePrompt');
-  const prompt = (promptEl && promptEl.value || '').trim();
-  const summary = document.getElementById('compareSummary');
-  if (!prompt) { if (promptEl) promptEl.focus(); return; }
-  const entries = renderCompareColumns();
-  if (!entries.length) return;
-  const tokensEl = document.getElementById('compareMaxTokens');
-  const maxTokens = Math.max(8, Math.min(2048, parseInt(tokensEl && tokensEl.value, 10) || 256));
-  const parallel = !!(document.getElementById('compareParallel') || {}).checked;
-  const run = document.getElementById('compareRunBtn');
-  const stop = document.getElementById('compareStopBtn');
-  _compareRunning = true;
-  _compareControllers = [];
-  if (run) run.style.display = 'none';
-  if (stop) stop.style.display = '';
-  if (summary) summary.textContent = parallel
-    ? `Running ${entries.length} model${entries.length === 1 ? '' : 's'} at the same time…`
-    : `Running ${entries.length} model${entries.length === 1 ? '' : 's'} one after another…`;
-  const started = performance.now();
+async function compareChoose(turn, answer) {
   try {
-    if (parallel) {
-      await Promise.all(entries.map(e => compareRunOne(e, prompt, maxTokens, started)));
-    } else {
-      for (const e of entries) {
-        if (!_compareRunning) break;
-        await compareRunOne(e, prompt, maxTokens, performance.now());
-      }
-    }
-  } finally {
-    const wall = (performance.now() - started) / 1000;
-    const total = entries.reduce((n, e) => n + ((((_compareResults[e.model] || {}).stats || {}).tokens) || 0), 0);
-    if (summary) summary.textContent = `${entries.length} model${entries.length === 1 ? '' : 's'}`
-      + ` ${parallel ? 'at the same time' : 'one after another'} · ${total} tokens in ${wall.toFixed(1)}s`
-      + (wall > 0 ? ` · ${(total / wall).toFixed(1)} tok/s combined` : '');
-    _compareRunning = false;
-    _compareControllers = [];
-    if (run) { run.style.display = ''; run.disabled = false; }
-    if (stop) stop.style.display = 'none';
+    const resp = await fetch('/compare/choose', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turn, answer }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    return (data && data.result) || 'stale';
+  } catch (e) {
+    return 'stale';
   }
 }
 
-function stopCompare() {
-  if (!_compareRunning) return;
-  _compareRunning = false;
-  // Aborting the fetch makes the proxy post /stop for that model.
-  _compareControllers.forEach(c => { try { c.abort(); } catch (e) { /* already done */ } });
+function compareMarkChosen(ctx, chosen) {
+  ctx.cols.forEach(c => {
+    const is = c === chosen;
+    c.col.classList.toggle('is-chosen', is);
+    const old = c.col.querySelector('.compare-col-pick');
+    if (old) old.remove();
+    if (is) {
+      compareSetState(c, '✓ The conversation continues from this answer'
+        + (c.stopped ? ' (stopped early)' : ''), 'ok');
+      return;
+    }
+    if (c.stateEl.classList.contains('is-ok')) compareSetState(c, c.stopped ? 'Stopped' : '', c.stopped ? 'muted' : '');
+    if (!c.text.trim()) return;
+    const pick = document.createElement('button');
+    pick.type = 'button';
+    pick.className = 'compare-col-pick';
+    pick.textContent = 'Continue with this answer';
+    pick.title = `Carry on the conversation from this answer and chat with ${c.model}`;
+    pick.addEventListener('click', async () => {
+      pick.disabled = true;
+      const result = await compareChoose(ctx.turn, c.text);
+      if (result === 'replaced' || result === 'recorded') {
+        compareMarkChosen(ctx, c);
+        setActiveChatModel(c.model);
+      } else {
+        retireComparePicks();   // the conversation has moved on
+      }
+    });
+    c.col.querySelector('.compare-col-foot').appendChild(pick);
+  });
+}
+
+// Only the latest turn can still change which answer the chat continues from.
+function retireComparePicks() {
+  if (!chatMessages) return;
+  chatMessages.querySelectorAll('.compare-col-pick').forEach(b => b.remove());
+}
+
+async function runCompareTurn(info) {
+  const built = buildCompareBlock(info);
+  const ctx = {
+    turn: info.turn, cols: built.cols, block: built.block, controllers: [],
+    activeAtSend: getSelectedChatModel(),
+  };
+  _compareActiveTurn = ctx;
+  showAbortButton();
+  const t0 = performance.now();
+  ctx.done = (async () => {
+    await Promise.all(ctx.cols.map(c => compareStreamOne(ctx, c, t0)));
+    const wall = (performance.now() - t0) / 1000;
+    const total = ctx.cols.reduce((n, c) => n + c.tokens, 0);
+    built.summaryEl.textContent = total
+      ? `${total} tokens in ${wall.toFixed(1)}s · ${(total / Math.max(wall, 0.001)).toFixed(1)} tok/s combined`
+      : '';
+    // The reply the conversation carries on from: the active model's, else the
+    // first that produced one. With none, the unanswered turn is taken back out.
+    const answered = ctx.cols.filter(c => c.text.trim());
+    const chosen = answered.find(c => c.model === ctx.activeAtSend) || answered[0] || null;
+    const result = await compareChoose(ctx.turn, chosen ? chosen.text : '');
+    if (chosen && (result === 'recorded' || result === 'replaced')) compareMarkChosen(ctx, chosen);
+    // A newer request may already own the composer state; leave it alone then.
+    if (_compareActiveTurn === ctx) {
+      _compareActiveTurn = null;
+      activeGeneration = false;
+      receivedEndSignal = true;
+      pendingNewGenerationAudio = false;
+      hideAbortButton();
+      const ft = document.getElementById('firstTokenTime');
+      const tp = document.getElementById('tpsValue');
+      if (ft) ft.textContent = chosen && chosen.ttftS != null ? `${compareFmt(chosen.ttftS, 2)}s` : '—';
+      if (tp) tp.textContent = chosen && chosen.tps != null ? compareFmt(chosen.tps, 2) : '—';
+    }
+    scrollChatToBottom();
+  })();
+  return ctx.done;
+}
+
+// Stop the streams of the turn in flight and wait for it to wind up (which
+// records whatever was produced), so a following request sees settled history.
+async function abortCompareStreams() {
+  const ctx = _compareActiveTurn;
+  if (!ctx) return;
+  // Aborting the fetch makes the server post /stop for that model.
+  ctx.controllers.forEach(c => { try { c.abort(); } catch (e) { /* already done */ } });
+  try { await ctx.done; } catch (e) { /* winding up is best-effort */ }
 }
 
 function openBenchmark() {
