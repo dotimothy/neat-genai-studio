@@ -1,5 +1,10 @@
 # Neat GenAI Studio
 
+<p align="center">
+  <img src="docs/media/chat.gif" alt="Chatting with Gemma 4 E2B in Neat GenAI Studio: the reply streams in as Markdown while the latency and tokens-per-second readouts update" width="900">
+</p>
+<p align="center"><em>Gemma 4 E2B answering on a Modalix DevKit. Recorded in real time, not sped up.</em></p>
+
 ## Metadata
 | Field | Value |
 | --- | --- |
@@ -25,9 +30,28 @@ The Studio starts without a chat model loaded. From the web interface you can:
 The interface and its fonts and JavaScript libraries run locally. Internet access is needed only when you search for or download a model from Hugging Face.
 
 ## Preview
-Neat GenAI Studio UI:
+All captures below come from a Modalix DevKit running the Studio, with `gemma-4-E2B-it-GPTQ-a16w4` loaded.
 
-![Neat GenAI Studio preview](docs/preview.png)
+<table>
+  <tr>
+    <td width="50%" align="center" valign="top"><b>Ask about an image</b><br><img src="docs/media/vision.gif" alt="Uploading a photo of Earth and asking the vision-language model what it shows"></td>
+    <td width="50%" align="center" valign="top"><b>Load a model without restarting</b><br><img src="docs/media/load-model.gif" alt="Loading a model from Settings, Models with a live progress bar"></td>
+  </tr>
+  <tr>
+    <td align="center" valign="top"><b>Home screen</b><br><img src="docs/media/home.png" alt="Studio home screen in the dark theme with a vision model loaded"></td>
+    <td align="center" valign="top"><b>Light theme, Markdown and math</b><br><img src="docs/media/chat-light.png" alt="A reply with bullet points and rendered LaTeX in the light theme"></td>
+  </tr>
+  <tr>
+    <td align="center" valign="top"><b>Audio API playground</b><br><img src="docs/media/playground.png" alt="Audio API playground after synthesizing a sentence, showing the waveform and timings"></td>
+    <td align="center" valign="top"><b>Benchmark (TTFT / TPS)</b><br><img src="docs/media/benchmark.png" alt="Benchmark results with time to first token and tokens per second across five runs"></td>
+  </tr>
+  <tr>
+    <td align="center" valign="top"><b>SiMaSentry Solutions</b><br><img src="docs/media/solutions.png" alt="SiMaSentry Mission Control with the Med, Safe and Sec harness cards"></td>
+    <td align="center" valign="top"><b>Showcase (present mode)</b><br><img src="docs/media/showcase.png" alt="First slide of the showcase slideshow served at /showcase"></td>
+  </tr>
+</table>
+
+The photo in the vision demo is NASA's Apollo 17 view of Earth (AS17-148-22727, public domain).
 
 ## Prerequisites
 - Installed Neat Development Environment + Neat Library.
@@ -385,6 +409,10 @@ The waveform button in the header opens the **Audio API playground**
 (`https://<board>:5000/playground/`, also usable standalone), a page built from
 the Studio's own design tokens, fonts, controls and spacing, with four modes:
 
+<p align="center">
+  <img src="docs/media/playground.png" alt="Speech mode of the Audio API playground: text, engine, voice and language on the left; waveform, player, timings and request body on the right" width="820">
+</p>
+
 - **Speech** fills its engine, voice and language pickers from
   `GET /v1/audio/voices`, calls `POST /v1/audio/speech`, draws and plays the
   result (Web Audio, with a scrubbable player and a download link) and shows the
@@ -417,6 +445,10 @@ the Studio's own design tokens, fonts, controls and spacing, with four modes:
   engine, voice and speed. Hands-free like Echo (the microphone is muted while
   a translation plays), with a text box for typed input, a swap button, and
   ASR, LLM and TTS timings per turn.
+
+<p align="center">
+  <img src="docs/media/playground-translate.png" alt="Translate mode of the Audio API playground with source and target language, tone, voice engine and voice-activity controls" width="820">
+</p>
 
 Speech, Transcription and Echo need no chat model; Translate needs one only for
 targets other than English (or for typed text), and says so when none is
@@ -492,6 +524,10 @@ its own slot and is untouched), so the MLA holds just the active model. A **Load
 top of the tab and shows the live progress bar while it loads. The studio cancels
 the outgoing model's in-flight generation and waits for its memory to be released
 before loading the new one, then warms it so your first message is instant.
+
+<p align="center">
+  <img src="docs/media/load-model.gif" alt="Pressing Load on a model in Settings, Models: the Load status panel shows progress, then the row turns to loaded" width="820">
+</p>
 
 If a switch hits an accelerator error, the Studio rolls back the failed model
 registration and reports the error. It does not restart or reset board services
@@ -575,6 +611,10 @@ the progress bar, and the model moves to the **Models** tab ready to load — a
 speech model into the **Speech-to-text** group. The account filter lists only
 accounts that returned results, and hides itself when just one is configured.
 
+<p align="center">
+  <img src="docs/media/settings-add-model.png" alt="Settings, Add Model tab listing downloadable models with size badges and the NVMe free-space readout" width="720">
+</p>
+
 Downloads land under `catalog_dir`. A repo from an account other than `simaai` is
 stored as `<org>@<name>`, so two accounts publishing the same model name cannot
 collide. Set `HF_TOKEN` for gated repos, and `HUB_ORGS` at install time (or
@@ -585,6 +625,10 @@ an account that is not listed is refused.
 The performance half of SiMa's **MoLE** (Modalix Language-model Evaluator) measures
 **Time-To-First-Token (TTFT)** and **Tokens-Per-Second (TPS)** by streaming from
 the on-device model. Open it with the speedometer icon in the header.
+
+<p align="center">
+  <img src="docs/media/benchmark.png" alt="Benchmark page after five runs: mean time to first token, mean tokens per second, a statistics table and a per-run chart" width="820">
+</p>
 
 - **Pick one, several, or all models.** The *Models to benchmark* control is a
   multi-select (with **Select all downloaded**). Each selected model is loaded and
@@ -610,6 +654,10 @@ host `llima-benchmark` CLI.)
 ### SiMaSentry Solutions (Med / Safe / Sec demo harnesses)
 The Studio includes three AI harnesses. **SiMaSentry-Med** provides clinical VLM chat and diagnostic imaging tools. **SiMaSentry-Safe** handles PPE and hazard inspection with live camera zones. **SiMaSentry-Sec** supports SOC threat analysis and change detection. Open them from the shield icon in the header.
 
+<p align="center">
+  <img src="docs/media/solutions.png" alt="SiMaSentry Mission Control portal with launch cards for SiMaSentry-Med, SiMaSentry-Safe and SiMaSentry-Sec" width="820">
+</p>
+
 - Picking a card launches the harness full-screen, **auto-wired to the currently
   loaded model** through a same-origin `/v1/chat/completions` proxy (the Studio
   page is HTTPS while the model server is HTTP, so the proxy avoids
@@ -630,10 +678,22 @@ Under **Appearance**, pick a font family and size or type any locally installed
 family; the choice is saved in the browser. The dark/light theme toggle is in the
 Settings header.
 
+<p align="center">
+  <img src="docs/media/chat-light.png" alt="A reply in the light theme with bold text, bullet points and LaTeX rendered inline and as a display equation" width="820">
+</p>
+
+<p align="center">
+  <img src="docs/media/settings-appearance.png" alt="Settings, Appearance tab with accent colour, font family and font size controls" width="720">
+</p>
+
 ### Text-to-speech (voices & languages)
 Spoken replies use a **multi-engine router** that picks the best offline TTS
 engine per language. The spoken language follows the **Transcription language**
 selector in Settings.
+
+<p align="center">
+  <img src="docs/media/settings-voice.png" alt="Settings, Conversation tab with the speak-responses toggle, transcription language, voice engine, voice and utterance speed" width="720">
+</p>
 
 | Engine | Licence | Runtime | Languages |
 | --- | --- | --- | --- |
@@ -774,6 +834,10 @@ The supported entrypoints are `src/python/server/main.py` for model hosting and
 
 ## RAG
 RAG is enabled by default after `./setup.sh`.
+
+<p align="center">
+  <img src="docs/media/settings-rag.png" alt="Settings, Knowledge (RAG) tab with the search toggle and the upload, import, inspect, reset and clear buttons" width="720">
+</p>
 
 The installer downloads `thenlper/gte-small`, stores it under the configured
 models directory, and creates:
