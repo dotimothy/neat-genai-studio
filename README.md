@@ -27,7 +27,7 @@ The interface and its fonts and JavaScript libraries run locally. Internet acces
 ## Preview
 Neat GenAI Studio UI:
 
-![Neat GenAI Studio preview](../../../portal/assets/examples/genai/neat-genai-studio/image.png)
+![Neat GenAI Studio preview](docs/preview.png)
 
 ## Prerequisites
 - Installed Neat Development Environment + Neat Library.
