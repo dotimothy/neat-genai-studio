@@ -140,6 +140,36 @@ class ResidentLimitTests(ModelDirsCase):
 
         self.assertEqual(manager.residency()["resident"], ["model-b"])
 
+    def test_unload_all_frees_every_chat_model_and_keeps_speech(self):
+        manager, server = self.manager(3)
+        for name in CHAT:
+            manager.load(name)
+        result = manager.unload_all()
+
+        self.assertEqual(sorted(result["unloaded"]), sorted(CHAT))
+        self.assertEqual(result["failed"], [])
+        self.assertEqual(manager.residency()["resident"], [])
+        self.assertEqual(server.model_names(), [ASR])
+        self.assertEqual(manager.active_asr(), ASR)
+
+    def test_unload_all_with_nothing_loaded_is_a_no_op(self):
+        manager, server = self.manager(2)
+        result = manager.unload_all()
+        self.assertEqual((result["unloaded"], result["failed"]), ([], []))
+        self.assertEqual(server.model_names(), [ASR])
+
+    def test_unload_all_carries_on_past_a_model_that_will_not_go(self):
+        manager, server = self.manager(2)
+        manager.load("model-a")
+        manager.load("model-b")
+        real = server.remove_model
+        with patch.object(server, "remove_model",
+                          side_effect=lambda n: False if n == "model-a" else real(n)):
+            result = manager.unload_all()
+        self.assertEqual(result["unloaded"], ["model-b"])
+        self.assertEqual(result["failed"], ["model-a"])
+        self.assertEqual(manager.residency()["resident"], ["model-a"])   # still tracked
+
     def test_a_failed_load_leaves_the_other_resident_models_alone(self):
         manager, server = self.manager(2, warmup=True)
         with patch.object(ModelManager, "_warm_check", return_value=(True, "")):

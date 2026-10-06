@@ -4443,11 +4443,11 @@ function openActiveModelMenu(anchor) {
   foot.className = 'active-model-menu-foot';
   const compare = document.createElement('button');
   compare.type = 'button'; compare.className = 'active-model-link';
-  compare.textContent = _compareMode ? 'Stop comparing' : 'Compare side by side';
+  compare.textContent = _compareMode ? 'Stop Comparing' : 'Compare Side by Side';
   compare.addEventListener('click', () => { closeActiveModelMenu(); setCompareMode(!_compareMode); });
   const manage = document.createElement('button');
   manage.type = 'button'; manage.className = 'active-model-link';
-  manage.textContent = 'Manage models…';
+  manage.textContent = 'Manage Models…';
   manage.addEventListener('click', () => { closeActiveModelMenu(); openSettings(); });
   foot.appendChild(compare); foot.appendChild(manage);
   menu.appendChild(foot);
@@ -4558,6 +4558,11 @@ function renderInstalledList() {
 
   const countEl = document.getElementById('modelInstalledCount');
   if (countEl) countEl.textContent = models.length ? `${filtered.length} of ${models.length}` : '';
+  const unloadAll = document.getElementById('modelUnloadAll');
+  if (unloadAll) {
+    unloadAll.hidden = !controlEnabled() || !models.some(m => m.loaded);
+    unloadAll.disabled = serverBusy();
+  }
 
   list.innerHTML = '';
   if (!models.length) {
@@ -4713,7 +4718,7 @@ function updateHomeModelIndicator() {
     const vision = typeof selectedChatModelSupportsVision === 'function' && selectedChatModelSupportsVision();
     const others = Math.max(0, loadedChatModels().length - 1);
     nameEl.textContent = _compareMode
-      ? `Comparing ${others + 1} models side by side`
+      ? `Comparing ${others + 1} Models Side by Side`
       : model + (vision ? '  ·  vision' : '') + (others > 0 ? `  ·  +${others} loaded` : '');
     box.classList.add('loaded');
     box.classList.remove('empty');
@@ -4794,6 +4799,8 @@ function initModelManage() {
 
   const mlaReset = document.getElementById('mlaResetButton');
   if (mlaReset) mlaReset.addEventListener('click', () => resetMla());
+  const unloadAll = document.getElementById('modelUnloadAll');
+  if (unloadAll) unloadAll.addEventListener('click', () => unloadAllModels());
 
   const retry = document.getElementById('modelLoadRetry');
   const viewLogs = document.getElementById('modelLoadErrorLogs');
@@ -4839,6 +4846,48 @@ async function unloadModel(name) {
   } catch (err) {
     stopLoadTicker();
     setModelStatus(`Failed to unload ${name}: ${err.message}`, 'error');
+  } finally {
+    stopLoadTicker();
+    setModelLoadBar(null);
+    _modelBusy = false;
+    await refreshCatalog();
+    if (typeof updateSelectedModelVisionState === 'function') updateSelectedModelVisionState();
+  }
+}
+
+// Unload every chat/VLM model in one go, freeing the accelerator for
+// something else. Speech-to-text has its own slot and stays.
+async function unloadAllModels() {
+  const loaded = loadedChatModels();
+  if (!loaded.length || _modelBusy) return;
+  const what = loaded.length === 1 ? `"${loaded[0].name}"` : `all ${loaded.length} models`;
+  if (!window.confirm(`Unload ${what} from the accelerator? Speech-to-text stays loaded, and you can load them again anytime.`)) return;
+  _modelBusy = true;
+  updateManageButtons();
+  // Fill against the measured unload times when every model has one.
+  const times = loaded.map(m => m.estimatedUnloadS);
+  const est = times.every(t => typeof t === 'number' && t > 0) ? times.reduce((a, b) => a + b, 0) : null;
+  const label = loaded.length === 1 ? loaded[0].name : `${loaded.length} models`;
+  startLoadTicker(label, est, null, 'Unloading');
+  try {
+    const resp = await fetch('/models/unload-all', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || 'unload failed');
+    stopLoadTicker();
+    const done = Array.isArray(data.unloaded) ? data.unloaded : [];
+    const failed = Array.isArray(data.failed) ? data.failed : [];
+    const secs = (typeof data.unload_seconds === 'number' && data.unload_seconds > 0)
+      ? ` in ${data.unload_seconds.toFixed(1)}s` : '';
+    if (failed.length) {
+      setModelStatus(`Unloaded ${done.length}, but could not unload ${failed.join(', ')}`, 'error');
+    } else {
+      setModelStatus(`Unloaded ${done.length} model${done.length === 1 ? '' : 's'}${secs}`, 'muted');
+    }
+  } catch (err) {
+    stopLoadTicker();
+    setModelStatus(`Failed to unload: ${err.message}`, 'error');
   } finally {
     stopLoadTicker();
     setModelLoadBar(null);
@@ -7089,8 +7138,8 @@ function syncCompareUi() {
     btn.classList.toggle('is-on', _compareMode);
     btn.setAttribute('aria-pressed', _compareMode ? 'true' : 'false');
     btn.title = _compareMode
-      ? 'Compare is on: every loaded model answers side by side. Click to turn off.'
-      : 'Compare: have every loaded model answer side by side';
+      ? 'Compare Side by Side is on: every loaded model answers. Click to turn off.'
+      : 'Compare Side by Side: have every loaded model answer';
   }
   document.body.classList.toggle('compare-mode', _compareMode);
 }
@@ -7120,7 +7169,7 @@ function buildCompareBlock(info) {
   block.dataset.turn = info.turn;
   const head = document.createElement('div');
   head.className = 'compare-turn-head';
-  head.innerHTML = `<span class="compare-turn-title">Side by side · ${info.models.length} models</span>`
+  head.innerHTML = `<span class="compare-turn-title">Side by Side · ${info.models.length} Models</span>`
     + '<span class="compare-turn-summary"></span>';
   const grid = document.createElement('div');
   grid.className = 'compare-grid';

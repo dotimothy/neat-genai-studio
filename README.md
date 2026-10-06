@@ -492,6 +492,7 @@ POST /v1/audio/transcriptions      speech to text in the spoken language
 POST /v1/audio/translations        speech to English text
 GET  /models/status, /models/catalog; POST /models/load, /models/unload, /models/asr, ...
 POST /models/max-resident {"limit": n}   how many chat/VLM models stay loaded together
+POST /models/unload-all                  unload every chat/VLM model (speech-to-text stays)
 POST /models/active {"name": "..."}      mark a loaded model most recently used (evicted last)
 GET  /models/memory                      accelerator memory: pool size, held by the runtime, per-model estimates
 POST /compare/stream {"turn", "model"}   one model's streamed answer to a side-by-side turn (the web UI's Compare)
@@ -584,6 +585,9 @@ or released by anything on the board shows up without reloading.
 accelerator error; the models already loaded stay loaded, and the error names
 them so you can unload one and try again.
 
+**Unload All**, at the top of the model list (`/unload all` in the terminal
+chat), unloads every chat/VLM model in one step. Speech-to-text stays loaded.
+
 With two or more loaded:
 
 - **Pick who answers.** The model pill in the header (and the indicator on the
@@ -592,8 +596,8 @@ With two or more loaded:
   nothing is loaded or unloaded, and the conversation carries over. Each reply
   is tagged with the model that wrote it. Images from earlier turns are left out
   of requests to a text-only model and sent again when you switch back.
-- **Compare side by side.** The two-column button in the header (also in the
-  model menu) switches **Compare** on. While it is on, every message you send,
+- **Compare Side by Side.** The two-column button in the header (also
+  **Compare Side by Side** in the model menu) switches it on. While it is on, every message you send,
   typed or spoken, with or without an image, is answered by all loaded models
   at the same time, each in its own card in the conversation with its token
   count, tokens per second, first-token time and total time, plus the combined

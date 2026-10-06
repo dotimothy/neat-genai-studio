@@ -1149,8 +1149,9 @@ HELP = f"""{MUTED}Commands:
                      turn, and chat with that model
   /download          browse Hugging Face — pick one, several, or all models to
                      download (Space to multi-select, 'a' for all), then load one
-  /unload [name]     unload a model (no name → the loaded LLM/VLM; a menu when
-                     several are loaded)
+  /unload [name|all] unload a model (no name → the loaded LLM/VLM; a menu when
+                     several are loaded). /unload all unloads every LLM/VLM;
+                     speech-to-text stays
   /delete [name]     delete a model's weights from disk (no name → menu; asks to
                      confirm; aliases /rm, /remove)
   /image [path]      attach an image to your next message (VLM only; no path → prompt)
@@ -2858,7 +2859,8 @@ def main():
                 else:
                     print(f"{ERR}  the model server did not come back — check run.sh.{RESET}")
             elif cmd == "unload":
-                names = [arg] if arg else [
+                everything = arg.lower() == "all"
+                names = [arg] if arg and not everything else [
                     m.get('name') for m in catalog(ctrl)
                     if m.get('loaded') and m.get('type', 'chat') != 'asr']
                 if not names:

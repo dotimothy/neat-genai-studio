@@ -73,8 +73,8 @@
             <path d="M12 2l8 3.2V11c0 5-3.4 8.9-8 11-4.6-2.1-8-6-8-11V5.2L12 2z" fill="url(#slMark)"/></svg>
         </a>
         <button id="compareButton" class="header-icon-btn" type="button" style="display: none;"
-          title="Compare: have every loaded model answer side by side" aria-pressed="false"
-          aria-label="Compare: have every loaded model answer side by side">
+          title="Compare Side by Side: have every loaded model answer" aria-pressed="false"
+          aria-label="Compare Side by Side: have every loaded model answer">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2"
             stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="7.5" height="16" rx="1.5"/><rect x="13.5" y="4" width="7.5" height="16" rx="1.5"/></svg>
         </button>
@@ -382,6 +382,8 @@
                 <div class="model-list-group" id="modelInstalledGroup">
                   <div class="model-list-head">
                     <span class="model-list-title">Downloaded &mdash; on this board</span>
+                    <button id="modelUnloadAll" class="setting-button model-unload-all" type="button" hidden
+                      title="Unload every chat/VLM model from the accelerator. Speech-to-text stays loaded.">Unload All</button>
                     <span id="modelInstalledCount" class="model-list-count"></span>
                   </div>
                   <div id="modelInstalledList" class="model-list"></div>

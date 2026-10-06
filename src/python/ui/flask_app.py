@@ -2086,6 +2086,11 @@ class AppContext:
             name = (request.get_json(silent=True) or {}).get('name', '')
             return _proxy_control('POST', '/control/unload', 60, {'name': name})
 
+        @self.app.route('/models/unload-all', methods=['POST'])
+        def models_unload_all():
+            # Every chat/VLM model; the speech-to-text model stays loaded.
+            return _proxy_control('POST', '/control/unload_all', 300, {})
+
         @self.app.route('/models/max-resident', methods=['POST'])
         def models_max_resident():
             # How many chat/VLM models stay loaded together. Lowering it can

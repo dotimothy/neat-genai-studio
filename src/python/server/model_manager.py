@@ -1324,6 +1324,30 @@ class ModelManager:
         return {"name": name, "state": "unloaded" if removed else "absent",
                 "unload_seconds": round(time.monotonic() - started, 1)}
 
+    def unload_all(self) -> dict:
+        """Unload every chat/VLM model. Speech-to-text keeps its own slot and
+        stays, so voice input still works afterwards."""
+        unloaded: list[str] = []
+        failed: list[str] = []
+        started = time.monotonic()
+        with self._op_lock:
+            self._sync_resident_from_server()
+            with self._lock:
+                names = list(self._resident)
+            for name in names:
+                # One model that will not go must not strand the others.
+                try:
+                    removed = self._unload_timed(name)
+                except Exception:  # noqa: BLE001 - reported in "failed"
+                    removed = False
+                (unloaded if removed else failed).append(name)
+                if removed:
+                    with self._lock:
+                        if name in self._resident:
+                            self._resident.remove(name)
+        return {"unloaded": unloaded, "failed": failed,
+                "unload_seconds": round(time.monotonic() - started, 1)}
+
     def delete(self, name: str) -> dict:
         """Unload (if loaded) and delete a model's files from the catalog.
 
