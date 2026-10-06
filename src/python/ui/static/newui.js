@@ -93,6 +93,9 @@ let _activeChatModel = '';
 let _maxResident = 1;
 let _maxResidentCap = 8;
 let _residentOrder = [];
+// Accelerator memory as the server reports it: pool size plus an estimate of
+// what the loaded models take up.
+let _mlaMemory = null;
 // The model the last chat request was sent to, for the per-reply model tag.
 let _lastRequestModel = '';
 const ACTIVE_MODEL_KEY = 'studioActiveChatModel';
@@ -4180,10 +4183,57 @@ function applyResidency(data) {
   const cap = Number(data.maxResidentLimit);
   if (Number.isFinite(cap) && cap >= 1) _maxResidentCap = cap;
   if (Array.isArray(data.resident)) _residentOrder = data.resident.slice();
+  if (data.mla && typeof data.mla === 'object') _mlaMemory = data.mla;
   renderResidentLimit();
+  renderMlaMemory();
 }
 
-// The "Keep loaded" control in Settings → Models.
+// "≈ 2.3 GB of 16 GB" (or just the estimate when the pool size is unknown).
+function mlaMemorySummary() {
+  const m = _mlaMemory;
+  if (!m || typeof m.usedBytes !== 'number') return '';
+  const used = m.usedBytes > 0 ? `≈ ${fmtBytes(m.usedBytes)}` : '0';
+  return m.totalBytes ? `${used} of ${fmtBytes(m.totalBytes)}` : `${used} in use`;
+}
+
+// The MLA memory meter in Settings → Models: one segment per loaded model.
+function renderMlaMemory() {
+  const box = document.getElementById('modelMlaMemory');
+  const text = document.getElementById('modelMlaText');
+  const bar = document.getElementById('modelMlaBar');
+  const note = document.getElementById('modelMlaNote');
+  if (!box || !bar) return;
+  const m = _mlaMemory;
+  if (!controlEnabled() || !m || typeof m.usedBytes !== 'number') { box.style.display = 'none'; return; }
+  box.style.display = '';
+  const entries = Object.entries(m.models || {}).sort((a, b) => b[1] - a[1]);
+  const total = m.totalBytes || 0;
+  const pct = total ? Math.min(100, m.usedBytes / total * 100) : 0;
+  if (text) {
+    text.textContent = mlaMemorySummary()
+      + (total ? ` · ${pct < 1 && m.usedBytes ? '<1' : Math.round(pct)}%` : '')
+      + ` · ${entries.length} model${entries.length === 1 ? '' : 's'} loaded`;
+  }
+  bar.innerHTML = '';
+  bar.setAttribute('aria-label', `MLA memory ${mlaMemorySummary()}`);
+  bar.classList.toggle('is-high', pct >= 85);
+  // Without a known pool size the bar only shows the split between models.
+  const scale = total || m.usedBytes || 1;
+  entries.forEach(([name, bytes], i) => {
+    const seg = document.createElement('span');
+    seg.className = `model-mla-seg model-mla-seg-${i % 5}`;
+    seg.style.width = `${Math.max(0.6, bytes / scale * 100)}%`;
+    seg.title = `${name} · ≈ ${fmtBytes(bytes)}`;
+    bar.appendChild(seg);
+  });
+  if (note) {
+    const list = entries.map(([name, bytes]) => `${name} ≈ ${fmtBytes(bytes)}`).join(' · ');
+    note.textContent = (list ? `${list}. ` : '')
+      + 'Estimated from the size of each loaded model’s accelerator files; the board does not report memory in use, and other programs on the accelerator are not counted.';
+  }
+}
+
+// The "Max loaded models" control in Settings → Models.
 function renderResidentLimit() {
   const row = document.getElementById('modelResidentRow');
   const sel = document.getElementById('modelMaxResident');
@@ -4196,7 +4246,7 @@ function renderResidentLimit() {
     for (let n = 1; n <= top; n++) {
       const o = document.createElement('option');
       o.value = String(n);
-      o.textContent = n === 1 ? '1 model' : `${n} models`;
+      o.textContent = n === 1 ? '1 Model' : `${n} Models`;
       sel.appendChild(o);
     }
   }
@@ -4206,6 +4256,7 @@ function renderResidentLimit() {
     note.textContent = _maxResident > 1
       ? `Up to ${_maxResident} chat models stay loaded together and share accelerator memory. Loading one more unloads the least recently used.`
       : 'Loading a model unloads the one already loaded. Raise this to keep several loaded and switch between them from the chat.';
+    if (_mlaMemory && _mlaMemory.totalBytes) note.textContent += ` MLA memory: ${mlaMemorySummary()}.`;
   }
 }
 
@@ -4215,14 +4266,14 @@ async function changeResidentLimit(limit) {
   const loaded = loadedChatModels().length;
   if (limit < loaded) {
     const drop = loaded - limit;
-    if (!window.confirm(`Keeping ${limit} loaded will unload ${drop} model${drop === 1 ? '' : 's'} now, least recently used first. Continue?`)) {
+    if (!window.confirm(`A maximum of ${limit} will unload ${drop} model${drop === 1 ? '' : 's'} now, least recently used first. Continue?`)) {
       renderResidentLimit();
       return;
     }
   }
   _modelBusy = true;
   updateManageButtons();
-  setModelStatus('Updating how many models stay loaded…', 'loading');
+  setModelStatus('Updating the maximum number of loaded models…', 'loading');
   try {
     const resp = await fetch('/models/max-resident', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -4232,7 +4283,7 @@ async function changeResidentLimit(limit) {
     if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
     applyResidency(data);
     const ev = Array.isArray(data.evicted) ? data.evicted : [];
-    setModelStatus(`Keeping up to ${_maxResident} model${_maxResident === 1 ? '' : 's'} loaded`
+    setModelStatus(`Maximum loaded models: ${_maxResident}`
       + (ev.length ? ` · unloaded ${ev.join(', ')}` : ''), 'muted');
   } catch (err) {
     setModelStatus(`Could not change the limit: ${err.message}`, 'error');
@@ -4261,6 +4312,13 @@ function openActiveModelMenu(anchor) {
   const head = document.createElement('div');
   head.className = 'active-model-menu-head';
   head.textContent = 'Chat with';
+  if (mlaMemorySummary()) {
+    const mem = document.createElement('span');
+    mem.className = 'active-model-menu-mem';
+    mem.textContent = `MLA memory ${mlaMemorySummary()}`;
+    mem.title = 'Estimated from the loaded models; other programs on the accelerator are not counted';
+    head.appendChild(mem);
+  }
   menu.appendChild(head);
   loadedChatModels().forEach(m => {
     const item = document.createElement('button');

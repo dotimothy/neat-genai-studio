@@ -98,6 +98,42 @@ _DEFAULT_SEC_PER_GB = 2.7
 # stops a typo from asking for an absurd count.
 MAX_RESIDENT_LIMIT = 8
 
+# Where the kernel publishes the board's reserved memory regions. The
+# accelerator's model memory is the DMS region(s) listed there.
+_RESERVED_MEMORY_DIR = Path("/proc/device-tree/reserved-memory")
+
+
+def mla_pool_bytes(base: Path = _RESERVED_MEMORY_DIR) -> int | None:
+    """Size of the accelerator's model-memory pool, or None when unknown.
+
+    On Modalix this memory is a reserved region (``dms@...``) outside the RAM
+    Linux manages, so it shows up in neither ``free`` nor ``/proc/meminfo``.
+    The device tree gives its size; nothing on the board reports how much of it
+    is in use (see ``ModelManager.mla_memory``).
+    """
+    def _cells(name: str, default: int) -> int:
+        try:
+            return int.from_bytes((base / name).read_bytes()[:4], "big") or default
+        except OSError:
+            return default
+
+    try:
+        nodes = sorted(n for n in base.iterdir() if n.name.startswith("dms"))
+    except OSError:
+        return None
+    addr_cells, size_cells = _cells("#address-cells", 2), _cells("#size-cells", 2)
+    total = 0
+    for node in nodes:
+        try:
+            reg = (node / "reg").read_bytes()
+        except OSError:
+            continue
+        start = addr_cells * 4
+        size = int.from_bytes(reg[start:start + size_cells * 4], "big")
+        total += size
+    return total or None
+
+
 _MLA_FAILURE_MARKERS = (
     "mlashm",
     "mla_load",
@@ -177,6 +213,8 @@ class ModelManager:
         self._resident: list[str] = []
         # Catalog by served name -> classification dict (name, path, type, ...).
         self._catalog: dict[str, dict] = {}
+        # Size of the accelerator's memory pool, read once on first use.
+        self._mla_total: int | None = None
         # On-disk weight size per model dir (cached; dirs are static once present).
         self._size_cache: dict[str, int] = {}
         # Weight-completeness per model dir (cached; cleared on each rescan).
@@ -378,11 +416,36 @@ class ModelManager:
     def residency(self) -> dict:
         """Chat/VLM models resident now (most recently used first) and the limit."""
         with self._lock:
-            return {
+            state = {
                 "resident": list(self._resident),
                 "maxResident": self._max_resident,
                 "maxResidentLimit": MAX_RESIDENT_LIMIT,
             }
+        state["mla"] = self.mla_memory()
+        return state
+
+    def mla_memory(self) -> dict:
+        """Accelerator memory: the pool's size and an estimate of what the
+        models this server has loaded take up.
+
+        The board has no counter for memory in use, so the figure is the size
+        of each loaded model's ELF stages, which is what gets transferred to
+        the accelerator. It covers chat/VLM and speech-to-text models loaded
+        here; other programs using the accelerator are not visible to us.
+        """
+        if self._mla_total is None:
+            self._mla_total = mla_pool_bytes() or 0
+        models: dict[str, int] = {}
+        for name in self._server_model_names():
+            size = self._elf_bytes(self.resolved_model_path(name))
+            if size:
+                models[name] = size
+        return {
+            "totalBytes": self._mla_total or None,
+            "usedBytes": sum(models.values()),
+            "models": models,
+            "estimated": True,
+        }
 
     def set_max_resident(self, limit) -> dict:
         """Change how many chat/VLM models may be resident at once.

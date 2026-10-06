@@ -356,10 +356,21 @@
                      studio restarts; server.models.max_resident_chat_models in
                      config.local.yaml sets the value it starts with. -->
                 <div class="setting-row model-resident-row" id="modelResidentRow" style="display: none;">
-                  <label for="modelMaxResident" class="model-resident-label">Keep loaded</label>
+                  <label for="modelMaxResident" class="model-resident-label">Max loaded models</label>
                   <select id="modelMaxResident" class="setting-select"
-                    title="How many chat/VLM models stay loaded on the accelerator at once"></select>
+                    title="The most chat/VLM models that stay loaded on the accelerator at once"></select>
                   <span class="hub-note" id="modelResidentNote"></span>
+                </div>
+
+                <!-- Accelerator memory: the pool's size and an estimate of what
+                     the models loaded here take up (the board has no counter). -->
+                <div class="model-mla-memory" id="modelMlaMemory" style="display: none;">
+                  <div class="model-mla-head">
+                    <span class="model-load-progress-label">MLA memory</span>
+                    <span id="modelMlaText" class="model-mla-text"></span>
+                  </div>
+                  <div class="model-mla-bar" id="modelMlaBar" role="img"></div>
+                  <div class="hub-note" id="modelMlaNote"></div>
                 </div>
 
                 <div class="setting-row model-reset-row">

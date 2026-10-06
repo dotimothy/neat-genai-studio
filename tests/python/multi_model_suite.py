@@ -8,14 +8,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from asr_switching_suite import FakeServer, make_model_dir
-from server.model_manager import MAX_RESIDENT_LIMIT, ModelManager
+from server.model_manager import MAX_RESIDENT_LIMIT, ModelManager, mla_pool_bytes
 from shared.config import HubConfig
 
 CHAT = ("model-a", "model-b", "model-c")
 ASR = "whisper-small-a16w8"
 
 
-class ResidentLimitTests(unittest.TestCase):
+class ModelDirsCase(unittest.TestCase):
+    """A catalog of fake model directories and a manager over a fake server."""
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -41,6 +43,8 @@ class ResidentLimitTests(unittest.TestCase):
         )
         return manager, server
 
+
+class ResidentLimitTests(ModelDirsCase):
     def test_default_limit_of_one_still_replaces_the_loaded_model(self):
         manager, server = self.manager(1)
         manager.load("model-a")
@@ -157,6 +161,60 @@ class ResidentLimitTests(unittest.TestCase):
         self.assertEqual(status["resident"], ["model-b", "model-a"])
         self.assertEqual(status["maxResident"], 2)
         self.assertEqual(status["maxResidentLimit"], MAX_RESIDENT_LIMIT)
+
+
+class MlaMemoryTests(ModelDirsCase):
+    """Accelerator memory: pool size from the device tree, usage estimated
+    from the ELF stages of the models this server has loaded."""
+
+    def reserved(self, nodes, cells=(2, 2)):
+        base = self.tmp / "reserved-memory"
+        base.mkdir()
+        (base / "#address-cells").write_bytes(cells[0].to_bytes(4, "big"))
+        (base / "#size-cells").write_bytes(cells[1].to_bytes(4, "big"))
+        for name, addr, size in nodes:
+            (base / name).mkdir()
+            (base / name / "reg").write_bytes(
+                addr.to_bytes(cells[0] * 4, "big") + size.to_bytes(cells[1] * 4, "big"))
+        return base
+
+    def test_pool_size_is_the_dms_region(self):
+        base = self.reserved([
+            ("dms@0x1400000000", 0x1300000000, 16 << 30),
+            ("linux,cma", 0x1000000000, 0x6FC00000),
+            ("evmem@0xF0000000", 0xF0000000, 0x4000000),
+        ])
+        self.assertEqual(mla_pool_bytes(base), 16 << 30)
+
+    def test_pool_size_honours_the_cell_widths(self):
+        base = self.reserved([("dms@40000000", 0x40000000, 0x20000000)], cells=(1, 1))
+        self.assertEqual(mla_pool_bytes(base), 0x20000000)
+
+    def test_pool_size_is_unknown_without_a_dms_region(self):
+        self.assertIsNone(mla_pool_bytes(self.reserved([("linux,cma", 0, 1 << 20)])))
+        self.assertIsNone(mla_pool_bytes(self.tmp / "missing"))
+
+    def test_usage_is_the_elf_size_of_what_is_loaded(self):
+        for name, size in (("model-a", 3000), ("model-b", 500), (ASR, 70)):
+            (self.tmp / name / "elf_files" / "stage0_mla.elf").write_bytes(b"x" * size)
+            (self.tmp / name / "tokenizer.json").write_bytes(b"y" * 9999)   # not counted
+        manager, _ = self.manager(2)
+        with patch("server.model_manager.mla_pool_bytes", return_value=16 << 30):
+            self.assertEqual(manager.mla_memory()["usedBytes"], 70)   # speech model only
+            manager.load("model-a")
+            manager.load("model-b")
+            mla = manager.status()["mla"]
+        self.assertEqual(mla["totalBytes"], 16 << 30)
+        self.assertEqual(mla["models"], {"model-a": 3000, "model-b": 500, ASR: 70})
+        self.assertEqual(mla["usedBytes"], 3570)
+        self.assertTrue(mla["estimated"])
+        manager.unload("model-a")
+        self.assertEqual(manager.mla_memory()["usedBytes"], 570)
+
+    def test_unknown_pool_size_is_reported_as_none(self):
+        manager, _ = self.manager(1)
+        with patch("server.model_manager.mla_pool_bytes", return_value=None):
+            self.assertIsNone(manager.mla_memory()["totalBytes"])
 
 
 if __name__ == "__main__":

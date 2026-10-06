@@ -151,7 +151,7 @@ Other useful environment variables:
   at runtime from **Settings → Models**.
 - `MAX_RESIDENT_CHAT_MODELS`: how many chat/VLM models stay loaded together
   (default `1`: loading a model unloads the one already loaded). It is the
-  value the Studio starts with; **Settings → Models → Keep loaded** changes it
+  value the Studio starts with; **Settings → Models → Max loaded models** changes it
   while the Studio runs. See
   [Keep several models loaded](#keep-several-models-loaded).
 - `ALLOW_HUB_DOWNLOAD`: `true`/`false` to enable/disable in-UI Hugging Face
@@ -528,7 +528,7 @@ The **Settings → Models** tab shows models downloaded to the board in a search
 `● loaded`, on-disk ones `○ downloaded`; press **Load** on a not-yet-loaded model
 to load it at runtime. By default that unloads the chat/VLM model already loaded
 (speech-to-text has its own slot and is untouched), so the MLA holds just the
-active model; raise **Keep loaded** to hold several instead (see
+active model; raise **Max loaded models** to hold several instead (see
 [Keep several models loaded](#keep-several-models-loaded)). A **Load status** panel pins to the
 top of the tab and shows the live progress bar while it loads. The studio cancels
 an outgoing model's in-flight generation and waits for its memory to be released
@@ -543,7 +543,7 @@ registration and reports the error. It does not restart or reset board services
 on its own — use **Reset MLA** below if the accelerator is genuinely wedged.
 
 ### Keep several models loaded
-**Settings → Models → Keep loaded** sets how many chat/VLM models stay on the
+**Settings → Models → Max loaded models** sets how many chat/VLM models stay on the
 accelerator together (1 to 4 in the UI; the control API accepts up to 8). With
 it above 1, **Load** adds a model next to the ones already loaded. Loading one
 more than the limit unloads the least recently used model first, and lowering
@@ -551,7 +551,11 @@ the limit unloads down to it straight away. Speech-to-text keeps its own slot
 and never counts.
 
 All loaded models share accelerator memory, so how many fit depends on their
-size, not on this number. A model that does not fit fails to load with the
+size, not on this number. The **MLA memory** meter under the setting shows the
+size of the accelerator's memory pool and an estimate of what the loaded
+models take up, one segment per model (speech-to-text included). The estimate
+is the size of each model's accelerator files: the board does not report
+memory in use, and other programs using the accelerator are not counted. A model that does not fit fails to load with the
 accelerator error; the models already loaded stay loaded, and the error names
 them so you can unload one and try again.
 
