@@ -848,6 +848,7 @@ window.onload = function () {
   initVision();
   initBenchmark();
   initActiveModelMenu();
+  initMlaPolling();
   initCompare();
   initShowcase();
   initSolutions();
@@ -4232,29 +4233,47 @@ function renderMlaMemory() {
       ? `${mlaMemorySummary()} held by the runtime · ${Math.round(pct)}% · ${loadedText}`
       : `${mlaMemorySummary()}${total ? ` · ${pct < 1 && m.usedBytes ? '<1' : Math.round(pct)}%` : ''} · ${loadedText}`;
   }
-  bar.innerHTML = '';
   bar.setAttribute('aria-label', `MLA memory ${mlaMemorySummary()}`);
   const high = pct >= 85;
   bar.classList.toggle('is-high', high);
+  // The bar's pieces are kept and resized rather than rebuilt, so a change
+  // between two readings slides instead of jumping.
+  let held = bar.querySelector('.model-mla-held');
   if (claimed != null) {
-    const held = document.createElement('span');
-    held.className = 'model-mla-held';
+    if (!held) {
+      held = document.createElement('span');
+      held.className = 'model-mla-held';
+      bar.prepend(held);
+    }
     held.style.width = `${pct}%`;
     held.title = `Held by the accelerator runtime: ${mlaFmt(claimed)} of ${mlaFmt(total)}`;
-    bar.appendChild(held);
+  } else if (held) {
+    held.remove();
   }
   // Without a known pool size the bar only shows the split between models.
   const scale = total || m.usedBytes || 1;
-  const segs = document.createElement('span');
-  segs.className = 'model-mla-segs';
+  let segs = bar.querySelector('.model-mla-segs');
+  if (!segs) {
+    segs = document.createElement('span');
+    segs.className = 'model-mla-segs';
+    bar.appendChild(segs);
+  }
+  const existing = new Map(Array.from(segs.children).map(el => [el.dataset.model, el]));
   entries.forEach(([name, bytes], i) => {
-    const seg = document.createElement('span');
+    let seg = existing.get(name);
+    if (seg) existing.delete(name);
+    else {
+      seg = document.createElement('span');
+      seg.dataset.model = name;
+      seg.style.width = '0%';
+    }
     seg.className = `model-mla-seg model-mla-seg-${i % 5}`;
-    seg.style.width = `${Math.max(0.6, bytes / scale * 100)}%`;
     seg.title = `${name} · ≈ ${mlaFmt(bytes)}`;
-    segs.appendChild(seg);
+    segs.appendChild(seg);                       // (re)append keeps largest-first order
+    const width = `${Math.max(0.6, bytes / scale * 100)}%`;
+    if (seg.style.width !== width) requestAnimationFrame(() => { seg.style.width = width; });
   });
-  bar.appendChild(segs);
+  existing.forEach(el => el.remove());
   if (note) {
     const list = entries.map(([name, bytes]) => `${name} ≈ ${mlaFmt(bytes)}`).join(' · ');
     const parts = [];
@@ -4266,6 +4285,52 @@ function renderMlaMemory() {
     if (claimed == null) parts.push('The memory the runtime holds could not be read, so only the estimate is shown; other programs on the accelerator are not counted.');
     note.textContent = parts.join(' ');
   }
+}
+
+// ---- Live MLA memory ---------------------------------------------------
+// The meter is refreshed every couple of seconds while it is on screen (the
+// Models tab of Settings, or the model menu), so memory taken or released by
+// anything on the board shows up without reloading. Nothing is fetched while
+// the meter is hidden, the page is in the background, or a load is in flight
+// (the control API does not answer during one anyway).
+const MLA_POLL_MS = 2000;
+let _mlaPollTimer = null;
+let _mlaPollBusy = false;
+
+function mlaMeterOnScreen() {
+  const menu = document.getElementById('activeModelMenu');
+  if (menu && !menu.hidden) return true;
+  const modal = document.getElementById('settingsModal');
+  if (!modal || modal.style.display !== 'flex') return false;
+  const panel = document.querySelector('.settings-tab-panel[data-tab="model"]');
+  return !!(panel && panel.classList.contains('is-active'));
+}
+
+async function pollMlaMemory() {
+  if (_mlaPollBusy || document.hidden || !controlEnabled() || serverBusy() || !mlaMeterOnScreen()) return;
+  _mlaPollBusy = true;
+  try {
+    const resp = await fetch('/models/memory', { cache: 'no-store' });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (!data || typeof data.usedBytes !== 'number') return;
+    _mlaMemory = data;
+    renderMlaMemory();
+    renderResidentLimit();
+    const menuMem = document.querySelector('.active-model-menu-mem');
+    if (menuMem && mlaMemorySummary()) menuMem.textContent = `MLA memory ${mlaMemorySummary()}`;
+  } catch (e) {
+    /* keep the last reading */
+  } finally {
+    _mlaPollBusy = false;
+  }
+}
+
+function initMlaPolling() {
+  if (_mlaPollTimer) return;
+  _mlaPollTimer = setInterval(pollMlaMemory, MLA_POLL_MS);
+  // Catch up at once when the page comes back to the foreground.
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) pollMlaMemory(); });
 }
 
 // The "Max loaded models" control in Settings → Models.
@@ -4870,7 +4935,7 @@ function startLoadTicker(name, estimateS, stagesTotal, verb = 'Loading') {
     parts.push(fmtDuration(Math.round(elapsed)));
     if (est) {
       const remain = Math.max(0, est - elapsed);
-      parts.push(remain > 0 ? `~${fmtDuration(Math.round(remain))} left` : 'finishing…');
+      parts.push(remain >= 0.5 ? `~${fmtDuration(Math.round(remain))} left` : 'finishing…');
     }
     setModelStatus(`${verb} ${name} · ${parts.join(' · ')}`, 'loading');
     setModelLoadBar(pct != null ? pct : 'active');
@@ -5487,7 +5552,8 @@ function setModelLoadBar(state) {
   const panel = document.getElementById('modelLoadProgress');
   if (!bar) return;
   const fill = bar.querySelector('.model-load-fill');
-  if (!state) {
+  // 0 is a real percentage (the first tick of a load or unload), not "hide".
+  if (state == null || state === false || state === '') {
     bar.style.display = 'none';
     if (fill) { fill.style.width = '0%'; fill.classList.remove('indeterminate'); }
     if (panel) panel.classList.remove('is-busy');

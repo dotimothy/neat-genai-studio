@@ -1926,6 +1926,11 @@ class AppContext:
         def models_status():
             return _proxy_control('GET', '/control/status', 10)
 
+        @self.app.route('/models/memory', methods=['GET'])
+        def models_memory():
+            # Polled by the MLA memory meter while it is on screen.
+            return _proxy_control('GET', '/control/memory', 5)
+
         @self.app.route('/models/catalog', methods=['GET'])
         def models_catalog():
             return _proxy_control('GET', '/control/catalog', 30)

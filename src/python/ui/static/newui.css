@@ -1559,7 +1559,17 @@ body.resizing video { pointer-events: none; }
 .model-mla-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .model-mla-text { font-size: 12.5px; color: var(--text-2); font-variant-numeric: tabular-nums; }
 .model-mla-bar { position: relative; width: 100%; height: 8px; border-radius: 4px; overflow: hidden; background: var(--surface-3); }
-.model-mla-held { position: absolute; inset: 0 auto 0 0; background: color-mix(in srgb, var(--text-3) 55%, var(--surface-3)); }
+.model-mla-held { position: absolute; inset: 0 auto 0 0; background: color-mix(in srgb, var(--text-3) 55%, var(--surface-3)); transition: width .7s ease, background-color .4s ease; }
+.model-mla-seg { transition: width .7s ease; }
+.model-mla-head .model-load-progress-label::after {
+  content: ''; display: inline-block; width: 6px; height: 6px; margin-left: 7px; border-radius: 50%;
+  background: var(--ok); vertical-align: 1px; animation: mla-live 2s ease-in-out infinite;
+}
+@keyframes mla-live { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .model-mla-held, .model-mla-seg { transition: none; }
+  .model-mla-head .model-load-progress-label::after { animation: none; opacity: .8; }
+}
 .model-mla-bar.is-high .model-mla-held { background: color-mix(in srgb, var(--warn, #d98324) 60%, var(--surface-3)); }
 .model-mla-segs { position: absolute; inset: 0; display: flex; gap: 2px; }
 .model-mla-seg { height: 100%; min-width: 3px; background: var(--accent); }

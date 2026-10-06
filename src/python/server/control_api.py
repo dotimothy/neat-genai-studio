@@ -68,6 +68,10 @@ class _ControlHandler(BaseHTTPRequestHandler):
         try:
             if path == "/control/status":
                 self._send_json(self.manager.status())
+            elif path == "/control/memory":
+                # Accelerator memory only: cheap enough to poll, unlike the
+                # status call, which rescans the catalog.
+                self._send_json(self.manager.mla_memory())
             elif path == "/control/logs":
                 after = int((query.get("after", ["0"])[0]) or 0)
                 self._send_json(self.manager.load_logs(after))

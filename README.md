@@ -493,6 +493,7 @@ POST /v1/audio/translations        speech to English text
 GET  /models/status, /models/catalog; POST /models/load, /models/unload, /models/asr, ...
 POST /models/max-resident {"limit": n}   how many chat/VLM models stay loaded together
 POST /models/active {"name": "..."}      mark a loaded model most recently used (evicted last)
+GET  /models/memory                      accelerator memory: pool size, held by the runtime, per-model estimates
 POST /compare/stream {"turn", "model"}   one model's streamed answer to a side-by-side turn (the web UI's Compare)
 POST /compare/choose {"turn", "answer"}  record which answer the conversation continues from
 GET/POST /tts/engine; GET /supertonic/voices, /piperplus/voices, /voices; POST /supertonic/select, /piperplus/select, /voices/select   voice settings
@@ -567,6 +568,9 @@ size, not on this number. The **MLA memory** meter under the setting shows the
 accelerator's memory pool (16 GB on a Modalix DevKit; it is separate from the
 RAM that `free` reports) and two things inside it:
 
+The meter refreshes every two seconds while it is on screen, so memory taken
+or released by anything on the board shows up without reloading.
+
 - **Held by the runtime** is measured: the pool memory the MLA dispatcher has
   taken, for every program on the board. This is what decides whether another
   model fits. The dispatcher does not always hand memory back when a model is
@@ -600,6 +604,12 @@ With two or more loaded:
   when that is on. A text-only model is not sent the image (its card says so),
   and comparison answers are shown, not spoken. Switch Compare off to go back
   to single replies in the same conversation.
+- **In the terminal chat too.** `/max 2` raises the limit and `/load` then adds
+  a model next to the loaded ones; `/use` switches which one you chat with
+  (the prompt shows `[model +1]`), `/compare` sends every message to all of
+  them at once, and `/pick` continues from another model's answer. The active
+  model's reply streams live while the others generate at the same time and
+  are printed after it, each with its own timing.
 - **Use them from the API.** Every loaded model is served by the
   OpenAI-compatible endpoint at once; name the one you want in `model`, and
   send requests to different models in parallel.

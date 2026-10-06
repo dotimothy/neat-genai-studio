@@ -52,6 +52,7 @@ from cli_think_suite import (  # noqa: E402,F401
     LiveStatusLineTests as CliLiveStatusLineTests,
     NoThinkRewriteTests as CliNoThinkRewriteTests,
     ResetDisconnectClassificationTests as CliResetDisconnectClassificationTests,
+    SeveralModelsTests as CliSeveralModelsTests,
     StreamTokenCountTests as CliStreamTokenCountTests,
     ThinkSplitterTests as CliThinkSplitterTests,
 )

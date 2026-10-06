@@ -912,12 +912,245 @@ def stream_chat(oai, model, messages, max_tokens, render=False, think=True):
     return "".join(parts), ttft, tps, tokens, reasoning_tokens
 
 
+# ---- several models at once ---------------------------------------------------
+def loaded_chat_models(ctrl):
+    """Names of the chat/VLM models loaded now, most recently used first."""
+    try:
+        status = ctrl_get(ctrl, "/control/status") or {}
+    except Exception:
+        return []
+    resident = status.get("resident")
+    if isinstance(resident, list):
+        return [str(n) for n in resident]
+    return [m.get("name") for m in status.get("catalog") or []
+            if m.get("loaded") and m.get("type", "chat") != "asr"]
+
+
+def residency_line(ctrl):
+    """One line on how many models may be loaded and on accelerator memory."""
+    try:
+        status = ctrl_get(ctrl, "/control/status") or {}
+    except Exception:
+        return ""
+    bits = []
+    limit = status.get("maxResident")
+    if isinstance(limit, (int, float)):
+        loaded = len(status.get("resident") or [])
+        bits.append(f"{loaded} of max {int(limit)} model{'' if int(limit) == 1 else 's'} loaded")
+    mla = status.get("mla") or {}
+    total, held, used = mla.get("totalBytes"), mla.get("claimedBytes"), mla.get("usedBytes")
+    if total and isinstance(held, (int, float)):
+        bits.append(f"MLA memory {fmt_bytes(held) or '0'} of {fmt_bytes(total)} held by the runtime")
+    elif total and isinstance(used, (int, float)):
+        bits.append(f"MLA memory ≈ {fmt_bytes(used) or '0'} of {fmt_bytes(total)} (estimate)")
+    return "  ·  ".join(bits)
+
+
+def set_max_loaded(ctrl, raw):
+    """Change how many chat/VLM models stay loaded together. Returns True on success."""
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        print(f"{ERR}  /max takes a whole number, e.g. /max 2{RESET}")
+        return False
+    before = loaded_chat_models(ctrl)
+    dropping = before[limit:] if limit >= 1 else []
+
+    def _attempt():
+        r = ctrl_post(ctrl, "/control/max_resident", {"limit": limit}, timeout=120)
+        if isinstance(r, dict) and r.get("error"):
+            raise RuntimeError(r["error"])
+        return r
+
+    try:
+        if dropping:
+            label = f"unloading {', '.join(dropping)} to fit a maximum of {limit}…"
+            if not _animate():
+                print(f"{MUTED}  {label}{RESET}")
+            with spinner(label):
+                r = _attempt()
+        else:
+            r = _attempt()
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8", "replace")).get("error")
+        except Exception:
+            detail = None
+        print(f"{ERR}  {detail or exc}{RESET}")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        print(f"{ERR}  {exc}{RESET}")
+        return False
+    evicted = r.get("evicted") if isinstance(r, dict) else None
+    if evicted:
+        print(f"{MUTED}  unloaded {', '.join(str(x) for x in evicted)}{RESET}")
+    now = r.get("maxResident", limit) if isinstance(r, dict) else limit
+    print(f"{OK}✔ max loaded models: {now}{RESET}"
+          + (f" {DIM}(/load adds a model next to the loaded ones){RESET}" if now > 1 else ""))
+    return True
+
+
+def use_model(ctrl, name):
+    """Point the chat at another loaded model and mark it most recently used on
+    the server, so it is the last one pushed out. Nothing is loaded or unloaded."""
+    try:
+        ctrl_post(ctrl, "/control/touch", {"name": name}, timeout=10)
+    except Exception:
+        pass                                     # an ordering hint only
+    print(f"{OK}✔ active model: {name}{RESET} {DIM}(already loaded){RESET}")
+
+
+def _without_images(messages):
+    """Copy of `messages` with image parts removed, for a text-only model."""
+    out = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            texts = [p.get("text", "") for p in content
+                     if isinstance(p, dict) and p.get("type") == "text"]
+            message = dict(message, content="\n".join(t for t in texts if t))
+        out.append(message)
+    return out
+
+
+def _answer_only(text):
+    """A finished reply with any reasoning block removed."""
+    splitter = _ThinkSplitter()
+    answer = []
+    for kind, piece in list(splitter.feed(text)) + list(splitter.flush()):
+        if kind == "reclassify":
+            answer = []                          # everything so far was reasoning
+        elif kind == "answer":
+            answer.append(piece)
+    return "".join(answer).strip()
+
+
+class BackgroundReply(threading.Thread):
+    """One model's reply to a side-by-side turn, collected off-screen while the
+    active model's reply streams to the terminal."""
+
+    def __init__(self, oai, model, messages, max_tokens, think=True):
+        super().__init__(name=f"reply-{model}", daemon=True)
+        self.model, self.tokens, self.raw = model, 0, ""
+        self.ttft = self.tps = self.error = self.seconds = None
+        self._response = None
+        payload = {"model": model,
+                   "messages": messages if think else _without_thinking(messages),
+                   "max_tokens": max_tokens, "stream": True}
+        if not think:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        self._request = urllib.request.Request(
+            f"http://{oai[0]}:{oai[1]}/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        self._stop_url = f"http://{oai[0]}:{oai[1]}/stop"
+
+    @property
+    def answer(self):
+        return _answer_only(self.raw)
+
+    def run(self):
+        started = time.monotonic()
+        try:
+            with urllib.request.urlopen(self._request, timeout=600) as resp:
+                self._response = resp
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except Exception:
+                        continue
+                    for key in ("ttft", "tps"):
+                        if key in obj:
+                            try:
+                                setattr(self, key, float(obj[key]))
+                            except (TypeError, ValueError):
+                                pass
+                    choices = obj.get("choices") or []
+                    delta = choices[0].get("delta", {}).get("content") if choices else None
+                    clean = _CTRL_TOKENS.sub("", delta) if delta else ""
+                    if clean:
+                        self.tokens += 1
+                        self.raw += clean
+        except urllib.error.HTTPError as exc:
+            self.error = f"HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')[:200]}"
+        except Exception as exc:  # noqa: BLE001 - reported with the reply
+            if not self.raw:
+                self.error = str(exc) or exc.__class__.__name__
+        finally:
+            self.seconds = time.monotonic() - started
+
+    def cancel(self):
+        """Stop generating: ask the server, and drop the connection."""
+        try:
+            _http(self._stop_url, {"model": self.model}, timeout=5)
+        except Exception:
+            pass
+        try:
+            if self._response is not None:
+                self._response.close()
+        except Exception:
+            pass
+
+
+def reply_stats(tokens, ttft, tps, reasoning_tokens=0):
+    bits = []
+    if tokens:
+        bits.append(f"{tokens} tok" + (f" (+{reasoning_tokens} reasoning)" if reasoning_tokens else ""))
+    if ttft is not None:
+        bits.append(f"ttft {ttft * 1000:.0f}ms")
+    if tps is not None:
+        bits.append(f"{tps:.1f} tok/s")
+    return "  ·  ".join(bits)
+
+
+def show_background_replies(jobs, render):
+    """Print each other model's reply once it is complete, waiting with a
+    spinner for any still generating. Returns False if the wait was cancelled."""
+    for job in jobs:
+        try:
+            if job.is_alive():
+                with spinner(lambda j=job: f"{j.model} is still generating… {j.tokens} tok"):
+                    while job.is_alive():
+                        job.join(0.2)
+        except KeyboardInterrupt:
+            for other in jobs:
+                if other.is_alive():
+                    other.cancel()
+            print(f"{MUTED}(stopped waiting for the other models){RESET}")
+            return False
+        print(f"{TEAL}{BOLD}neat ◂{RESET} {DIM}{job.model}{RESET}")
+        if job.error:
+            print(f"{ERR}  {job.error}{RESET}")
+            continue
+        answer = job.answer
+        print(render_markdown_ansi(answer) if render else answer)
+        stats = reply_stats(job.tokens, job.ttft, job.tps)
+        if stats:
+            print(f"{DIM}{stats}{RESET}")
+    return True
+
+
 HELP = f"""{MUTED}Commands:
   /models            list catalog models with metadata (● loaded, ○ not)
-  /load [name]       load a model (no name → arrow-key menu)
+  /load [name]       load a model (no name → arrow-key menu). It replaces the
+                     loaded one unless /max allows more, then it loads alongside
+  /max [n]           show, or set, how many models stay loaded together (1-8)
+  /use [name]        chat with another loaded model (no name → menu); nothing is
+                     loaded or unloaded and the conversation carries over
+  /compare [on|off]  every message is answered by all loaded models at once; the
+                     conversation continues from the active model's answer
+  /pick [name]       continue from another model's answer to the last /compare
+                     turn, and chat with that model
   /download          browse Hugging Face — pick one, several, or all models to
                      download (Space to multi-select, 'a' for all), then load one
-  /unload [name]     unload a model (no name → unload the loaded LLM/VLM)
+  /unload [name]     unload a model (no name → the loaded LLM/VLM; a menu when
+                     several are loaded)
   /delete [name]     delete a model's weights from disk (no name → menu; asks to
                      confirm; aliases /rm, /remove)
   /image [path]      attach an image to your next message (VLM only; no path → prompt)
@@ -2304,9 +2537,10 @@ def main():
     cat = catalog(ctrl)
     active = args.model.strip()
     if not active:
-        loaded = [m for m in cat if m.get("loaded") and (m.get("type", "chat") != "asr")]
+        loaded = loaded_chat_models(ctrl) or [
+            m["name"] for m in cat if m.get("loaded") and (m.get("type", "chat") != "asr")]
         if loaded:
-            active = loaded[0]["name"]
+            active = loaded[0]              # the most recently used one
 
     if active and not any(m.get("name") == active and m.get("loaded") for m in cat):
         if not load_model(ctrl, active, oai=oai):
@@ -2347,10 +2581,19 @@ def main():
             pass
 
     messages, system, pending_image, camera_device = [], None, None, None
+    compare = False          # /compare: every message goes to all loaded models
+    last_compare = {}        # model -> answer of the latest side-by-side turn
     while True:
+        loaded_count = len(loaded_chat_models(ctrl))   # other clients load models too
         # The prompt shows the loaded model, 🖼 if a one-shot image is queued,
         # and 📷 if the live camera is armed (a frame is grabbed every message).
+        # With several models loaded it also says how many more there are, or
+        # that every one of them will answer.
         mlabel = active if active else "no model"
+        if active and compare and loaded_count > 1:
+            mlabel = f"comparing {loaded_count} models"
+        elif active and loaded_count > 1:
+            mlabel = f"{active} +{loaded_count - 1}"
         marks = ""
         if pending_image:
             marks += f" {_rl(ACCENT)}🖼{_rl(RESET)}"
@@ -2383,6 +2626,9 @@ def main():
                 cat = catalog(ctrl)
                 if not cat:
                     print(f"{MUTED}  (catalog empty — use /download to fetch one){RESET}")
+                summary = residency_line(ctrl)
+                if summary:
+                    print(f"{MUTED}  {summary}{RESET}")
                 for m in cat:
                     mark = f"{OK}●{RESET}" if m.get("loaded") else f"{MUTED}○{RESET}"
                     meta = [type_label(m.get("type"))]
@@ -2394,7 +2640,63 @@ def main():
                         meta.append("incomplete")
                     act = f" {ACCENT}(active){RESET}" if m.get("name") == active else ""
                     print(f"  {mark} {m.get('name')}  {DIM}{' · '.join(str(x) for x in meta)}{RESET}{act}")
-            elif cmd in ("load", "use"):
+            elif cmd in ("max", "limit"):
+                if arg:
+                    set_max_loaded(ctrl, arg)
+                    loaded_count = len(loaded_chat_models(ctrl))
+                    if active and active not in loaded_chat_models(ctrl):
+                        active = (loaded_chat_models(ctrl) or [""])[0]
+                else:
+                    print(f"{MUTED}  {residency_line(ctrl) or 'unavailable'}  ·  /max <n> to change{RESET}")
+            elif cmd in ("compare", "sidebyside"):
+                want = arg.lower()
+                if want not in ("", "on", "off"):
+                    print(f"{MUTED}  usage: /compare [on|off]{RESET}")
+                    continue
+                compare = (not compare) if not want else (want == "on")
+                loaded_count = len(loaded_chat_models(ctrl))
+                if compare and loaded_count < 2:
+                    print(f"{MUTED}  compare is on, but it needs two or more loaded models: "
+                          f"/max 2, then /load another.{RESET}")
+                elif compare:
+                    print(f"{OK}✔ compare on{RESET} {DIM}— every message goes to all "
+                          f"{loaded_count} loaded models; the chat continues from {active}'s answer "
+                          f"(/pick to choose another).{RESET}")
+                else:
+                    print(f"{MUTED}  compare off — {active or 'the active model'} answers alone.{RESET}")
+            elif cmd in ("pick", "continue"):
+                if not last_compare or not messages or messages[-1].get("role") != "assistant":
+                    print(f"{MUTED}  nothing to pick: /pick follows a /compare turn.{RESET}")
+                    continue
+                choices = [m for m in last_compare if m != active]
+                name = arg or (select_menu([(m, m) for m in choices], "Continue from whose answer?")
+                               if choices else None)
+                if not name:
+                    print(f"{MUTED}  (cancelled){RESET}")
+                    continue
+                if name not in last_compare:
+                    print(f"{ERR}  {name} did not answer the last compare turn "
+                          f"({', '.join(last_compare)} did).{RESET}")
+                    continue
+                messages[-1] = {"role": "assistant", "content": last_compare[name]}
+                active = name
+                use_model(ctrl, name)
+                print(f"{MUTED}  the conversation continues from {name}'s answer.{RESET}")
+            elif cmd in ("use", "switch") and (not arg or arg in loaded_chat_models(ctrl)):
+                loaded = loaded_chat_models(ctrl)
+                if not arg:
+                    others = [m for m in loaded if m != active]
+                    if not others:
+                        print(f"{MUTED}  only {active or 'no model'} is loaded — /load another "
+                              f"(raise /max to keep both).{RESET}")
+                        continue
+                    arg = select_menu([(m, m) for m in others], "Chat with which loaded model?")
+                    if not arg:
+                        print(f"{MUTED}  (cancelled){RESET}")
+                        continue
+                active = arg
+                use_model(ctrl, arg)
+            elif cmd in ("load", "use", "switch"):
                 if not arg:
                     items = []
                     for m in catalog(ctrl):
@@ -2413,8 +2715,18 @@ def main():
                     if not arg:
                         print(f"{MUTED}  (cancelled){RESET}")
                         continue
-                if load_model(ctrl, arg, oai=oai):
-                    active, messages, pending_image = arg, [], None
+                if arg in loaded_chat_models(ctrl):
+                    active = arg                 # already loaded: just switch to it
+                    use_model(ctrl, arg)
+                elif load_model(ctrl, arg, oai=oai):
+                    active = arg
+                    loaded_count = len(loaded_chat_models(ctrl))
+                    if loaded_count > 1:
+                        # Loaded next to the others: the chat carries over.
+                        print(f"{MUTED}  {loaded_count} models loaded — /use to switch, "
+                              f"/compare to ask them all.{RESET}")
+                    else:
+                        messages, pending_image, last_compare = [], None, {}
             elif cmd in ("download", "hub"):
                 new = browse_and_download(ctrl, args.config, oai=oai)
                 if new:
@@ -2552,9 +2864,21 @@ def main():
                 if not names:
                     print(f"{MUTED}  no LLM/VLM is loaded.{RESET}")
                     continue
+                if not arg and len(names) > 1 and sys.stdin.isatty():
+                    names = select_multi([(n, n) for n in names], "Unload which models?")
+                    if not names:
+                        print(f"{MUTED}  (cancelled){RESET}")
+                        continue
                 for name in names:
-                    if unload_model(ctrl, name) and name == active:
-                        active = ""
+                    unload_model(ctrl, name)
+                still = loaded_chat_models(ctrl)
+                loaded_count = len(still)
+                if active and active not in still:
+                    # Carry on with another loaded model when there is one.
+                    active = still[0] if still else ""
+                    if active:
+                        print(f"{MUTED}  now chatting with {active}.{RESET}")
+                    else:
                         camera_device = None   # no model → live camera can't send
             elif cmd in ("delete", "rm", "remove"):
                 # Delete a model's weights from disk (server unloads it first if
@@ -2606,7 +2930,7 @@ def main():
                 messages = []
                 print(f"{OK}✔ system prompt {'set' if system else 'cleared'}.{RESET}")
             elif cmd in ("new", "clear"):
-                messages = []
+                messages, last_compare = [], {}
                 print(f"{OK}✔ conversation cleared.{RESET}")
             elif cmd in ("export", "save"):
                 if not messages:
@@ -2727,10 +3051,29 @@ def main():
         msgs = ([{"role": "system", "content": system}] if system else []) \
             + messages + [{"role": "user", "content": user_content}]
         render = sys.stdout.isatty()
+        # Compare: the other loaded models answer the same turn off-screen, at
+        # the same time, while the active model's reply streams here. A
+        # text-only model is sent the turn without its image.
+        jobs = []
+        if compare:
+            others = [m for m in loaded_chat_models(ctrl) if m != active]
+            loaded_count = len(others) + 1
+            if others:
+                vision = ({m.get("name"): bool(m.get("supportsVision")) for m in catalog(ctrl)}
+                          if turn_image is not None else {})
+                jobs = [BackgroundReply(
+                    oai, m, msgs if (turn_image is None or vision.get(m)) else _without_images(msgs),
+                    max_tokens, think=think) for m in others]
+            else:
+                print(f"{MUTED}  compare is on, but only {active} is loaded — it answers alone.{RESET}")
+        turn_started = time.monotonic()
+        for job in jobs:
+            job.start()
+        who = f" {DIM}{active}{RESET}" if jobs else ""
         if render:
-            print(f"{TEAL}{BOLD}neat ◂{RESET}")
+            print(f"{TEAL}{BOLD}neat ◂{RESET}{who}")
         else:
-            print(f"{TEAL}{BOLD}neat ◂{RESET} ", end="", flush=True)
+            print(f"{TEAL}{BOLD}neat ◂{RESET}{who} ", end="", flush=True)
         try:
             text, ttft, tps, tokens, reasoning_tokens = stream_chat(
                 oai, active, msgs, max_tokens, render=render, think=think)
@@ -2739,28 +3082,42 @@ def main():
                 _http(f"http://{oai[0]}:{oai[1]}/stop", {"model": active}, timeout=5)
             except Exception:
                 pass
+            for job in jobs:
+                job.cancel()
             print(f"\n{MUTED}(stopped){RESET}")
             continue
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:200]
+            for job in jobs:
+                job.cancel()
             print(f"\n{ERR}  HTTP {exc.code}: {detail}{RESET}")
             continue
         except Exception as exc:  # noqa: BLE001
+            for job in jobs:
+                job.cancel()
             print(f"\n{ERR}  {exc}{RESET}")
             continue
         if not render:
             print()   # render mode already printed the reply live, line-by-line
-        bits = []
-        if tokens:
-            bits.append(f"{tokens} tok" + (f" (+{reasoning_tokens} reasoning)" if reasoning_tokens else ""))
-        if ttft is not None:
-            bits.append(f"ttft {ttft * 1000:.0f}ms")
-        if tps is not None:
-            bits.append(f"{tps:.1f} tok/s")
-        if bits:
-            print(f"{DIM}{'  ·  '.join(bits)}{RESET}")
+        stats = reply_stats(tokens, ttft, tps, reasoning_tokens)
+        if stats:
+            print(f"{DIM}{stats}{RESET}")
         messages.append({"role": "user", "content": line})   # text only; the image is one-shot
         messages.append({"role": "assistant", "content": text})
+        if jobs:
+            finished = show_background_replies(jobs, render)
+            wall = time.monotonic() - turn_started
+            total = tokens + reasoning_tokens + sum(job.tokens for job in jobs)
+            last_compare = {active: text}
+            last_compare.update({job.model: job.answer for job in jobs
+                                 if not job.error and job.answer})
+            if finished:
+                print(f"{DIM}side by side: {len(jobs) + 1} models  ·  {total} tok in {wall:.1f}s"
+                      f"  ·  {total / max(wall, 0.001):.1f} tok/s combined{RESET}")
+            print(f"{MUTED}  the conversation continues from {active}'s answer — "
+                  f"/pick to continue from another.{RESET}")
+        else:
+            last_compare = {}
         pending_image = None
         print()
 

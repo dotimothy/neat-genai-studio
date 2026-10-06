@@ -551,9 +551,10 @@ class ModelManager:
             return value
         maps = read_dispatcher_maps()
         value = claimed_from_maps(maps, self._mla_regions) if maps is not None else None
-        # Back off for a minute when it cannot be read, rather than retrying
-        # sudo on every poll.
-        self._mla_claimed_cache = (now, value, 4.0 if value is not None else 60.0)
+        # Short enough that a client polling every couple of seconds sees it
+        # move. Back off for a minute when it cannot be read, rather than
+        # retrying sudo on every poll.
+        self._mla_claimed_cache = (now, value, 1.5 if value is not None else 60.0)
         return value
 
     def set_max_resident(self, limit) -> dict:

@@ -171,6 +171,57 @@ class NoThinkRewriteTests(unittest.TestCase):
         self.assertEqual(out[0]["content"][-1], {"type": "text", "text": "/no_think"})
 
 
+class SeveralModelsTests(unittest.TestCase):
+    """The pieces behind /max, /use, /compare and /pick."""
+
+    STATUS = {
+        "resident": ["model-b", "model-a"], "maxResident": 2,
+        "catalog": [{"name": "model-a", "loaded": True}, {"name": "model-b", "loaded": True},
+                    {"name": "whisper", "loaded": True, "type": "asr"}],
+        "mla": {"totalBytes": 16 << 30, "claimedBytes": 12 << 30, "usedBytes": 3 << 30},
+    }
+
+    def status(self, **changes):
+        return unittest.mock.patch.object(cli, "ctrl_get", return_value=dict(self.STATUS, **changes))
+
+    def test_loaded_models_come_most_recently_used_first(self):
+        with self.status():
+            self.assertEqual(cli.loaded_chat_models(None), ["model-b", "model-a"])
+
+    def test_an_older_server_without_the_order_still_lists_loaded_chat_models(self):
+        with self.status(resident=None):
+            self.assertEqual(cli.loaded_chat_models(None), ["model-a", "model-b"])   # no ASR
+        with unittest.mock.patch.object(cli, "ctrl_get", side_effect=OSError("down")):
+            self.assertEqual(cli.loaded_chat_models(None), [])
+
+    def test_residency_line_reports_the_limit_and_the_measured_memory(self):
+        with self.status():
+            line = cli.residency_line(None)
+        self.assertIn("2 of max 2 models loaded", line)
+        self.assertIn("12 GB of 16 GB held by the runtime", line)
+        with self.status(mla={"totalBytes": 16 << 30, "claimedBytes": None, "usedBytes": 3 << 30}):
+            self.assertIn("(estimate)", cli.residency_line(None))
+
+    def test_reasoning_is_removed_from_a_collected_reply(self):
+        self.assertEqual(cli._answer_only("<think>let me see</think>The answer."), "The answer.")
+        self.assertEqual(cli._answer_only("Just an answer."), "Just an answer.")
+        self.assertEqual(cli._answer_only("<think>never closed"), "")
+
+    def test_a_text_only_model_is_sent_the_turn_without_its_image(self):
+        messages = [{"role": "system", "content": "be brief"},
+                    {"role": "user", "content": [{"type": "text", "text": "what is this"},
+                                                 {"type": "image", "image": "data:..."}]}]
+        stripped = cli._without_images(messages)
+        self.assertEqual(stripped[0], messages[0])
+        self.assertEqual(stripped[1], {"role": "user", "content": "what is this"})
+        self.assertIsInstance(messages[1]["content"], list)        # the original is untouched
+
+    def test_reply_stats_line(self):
+        self.assertEqual(cli.reply_stats(70, 0.25, 30.0), "70 tok  ·  ttft 250ms  ·  30.0 tok/s")
+        self.assertEqual(cli.reply_stats(5, None, None, 12), "5 tok (+12 reasoning)")
+        self.assertEqual(cli.reply_stats(0, None, None), "")
+
+
 class LiveStatusLineTests(unittest.TestCase):
     """The animated status lines. Under the test runner stdout is not a
     terminal, so colour is off and the drawing can be compared as plain text."""
