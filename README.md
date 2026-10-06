@@ -552,10 +552,19 @@ and never counts.
 
 All loaded models share accelerator memory, so how many fit depends on their
 size, not on this number. The **MLA memory** meter under the setting shows the
-size of the accelerator's memory pool and an estimate of what the loaded
-models take up, one segment per model (speech-to-text included). The estimate
-is the size of each model's accelerator files: the board does not report
-memory in use, and other programs using the accelerator are not counted. A model that does not fit fails to load with the
+accelerator's memory pool (16 GB on a Modalix DevKit; it is separate from the
+RAM that `free` reports) and two things inside it:
+
+- **Held by the runtime** is measured: the pool memory the MLA dispatcher has
+  taken, for every program on the board. This is what decides whether another
+  model fits. The dispatcher does not always hand memory back when a model is
+  unloaded, so it can stay high with little loaded; when it is nearly full,
+  loads fail until **Reset MLA** releases it. Reading it needs root or
+  passwordless `sudo` (as Reset MLA does); set `STUDIO_MLA_MEMORY_SUDO=0` to
+  never use `sudo` for it, and the meter then shows the estimate only.
+- **The coloured segments** are the models loaded here, speech-to-text
+  included. Their sizes are estimates, taken from each model's accelerator
+  files, because the board has no per-model counter. A model that does not fit fails to load with the
 accelerator error; the models already loaded stay loaded, and the error names
 them so you can unload one and try again.
 

@@ -4188,15 +4188,29 @@ function applyResidency(data) {
   renderMlaMemory();
 }
 
-// "≈ 2.3 GB of 16 GB" (or just the estimate when the pool size is unknown).
+// Pool figures keep one decimal in GB: fmtBytes would round 15.5 GB up to
+// "16 GB" and make a nearly full pool read as exactly full.
+function mlaFmt(n) {
+  n = Number(n);
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  if (n < 1024 ** 3) return fmtBytes(n);
+  return `${(n / 1024 ** 3).toFixed(1).replace(/\.0$/, '')} GB`;
+}
+
+// The headline figure. Prefer what the accelerator runtime is actually holding
+// (measured, board-wide); fall back to the estimate for the loaded models.
 function mlaMemorySummary() {
   const m = _mlaMemory;
   if (!m || typeof m.usedBytes !== 'number') return '';
-  const used = m.usedBytes > 0 ? `≈ ${fmtBytes(m.usedBytes)}` : '0';
-  return m.totalBytes ? `${used} of ${fmtBytes(m.totalBytes)}` : `${used} in use`;
+  if (typeof m.claimedBytes === 'number' && m.totalBytes) {
+    return `${mlaFmt(m.claimedBytes)} of ${mlaFmt(m.totalBytes)}`;
+  }
+  const used = m.usedBytes > 0 ? `≈ ${mlaFmt(m.usedBytes)}` : '0';
+  return m.totalBytes ? `${used} of ${mlaFmt(m.totalBytes)}` : `${used} in use`;
 }
 
-// The MLA memory meter in Settings → Models: one segment per loaded model.
+// The MLA memory meter in Settings → Models. The underlay is what the runtime
+// holds (when it can be read); the segments are the loaded models (estimates).
 function renderMlaMemory() {
   const box = document.getElementById('modelMlaMemory');
   const text = document.getElementById('modelMlaText');
@@ -4208,28 +4222,49 @@ function renderMlaMemory() {
   box.style.display = '';
   const entries = Object.entries(m.models || {}).sort((a, b) => b[1] - a[1]);
   const total = m.totalBytes || 0;
-  const pct = total ? Math.min(100, m.usedBytes / total * 100) : 0;
+  const claimed = (typeof m.claimedBytes === 'number' && total) ? m.claimedBytes : null;
+  const headline = claimed != null ? claimed : m.usedBytes;
+  const pct = total ? Math.min(100, headline / total * 100) : 0;
+  const loadedText = `${entries.length} model${entries.length === 1 ? '' : 's'} loaded here`
+    + (m.usedBytes ? ` (≈ ${mlaFmt(m.usedBytes)})` : '');
   if (text) {
-    text.textContent = mlaMemorySummary()
-      + (total ? ` · ${pct < 1 && m.usedBytes ? '<1' : Math.round(pct)}%` : '')
-      + ` · ${entries.length} model${entries.length === 1 ? '' : 's'} loaded`;
+    text.textContent = claimed != null
+      ? `${mlaMemorySummary()} held by the runtime · ${Math.round(pct)}% · ${loadedText}`
+      : `${mlaMemorySummary()}${total ? ` · ${pct < 1 && m.usedBytes ? '<1' : Math.round(pct)}%` : ''} · ${loadedText}`;
   }
   bar.innerHTML = '';
   bar.setAttribute('aria-label', `MLA memory ${mlaMemorySummary()}`);
-  bar.classList.toggle('is-high', pct >= 85);
+  const high = pct >= 85;
+  bar.classList.toggle('is-high', high);
+  if (claimed != null) {
+    const held = document.createElement('span');
+    held.className = 'model-mla-held';
+    held.style.width = `${pct}%`;
+    held.title = `Held by the accelerator runtime: ${mlaFmt(claimed)} of ${mlaFmt(total)}`;
+    bar.appendChild(held);
+  }
   // Without a known pool size the bar only shows the split between models.
   const scale = total || m.usedBytes || 1;
+  const segs = document.createElement('span');
+  segs.className = 'model-mla-segs';
   entries.forEach(([name, bytes], i) => {
     const seg = document.createElement('span');
     seg.className = `model-mla-seg model-mla-seg-${i % 5}`;
     seg.style.width = `${Math.max(0.6, bytes / scale * 100)}%`;
-    seg.title = `${name} · ≈ ${fmtBytes(bytes)}`;
-    bar.appendChild(seg);
+    seg.title = `${name} · ≈ ${mlaFmt(bytes)}`;
+    segs.appendChild(seg);
   });
+  bar.appendChild(segs);
   if (note) {
-    const list = entries.map(([name, bytes]) => `${name} ≈ ${fmtBytes(bytes)}`).join(' · ');
-    note.textContent = (list ? `${list}. ` : '')
-      + 'Estimated from the size of each loaded model’s accelerator files; the board does not report memory in use, and other programs on the accelerator are not counted.';
+    const list = entries.map(([name, bytes]) => `${name} ≈ ${mlaFmt(bytes)}`).join(' · ');
+    const parts = [];
+    if (claimed != null) {
+      parts.push((high ? 'Nearly full: a load may fail until Reset MLA releases what the runtime is holding. ' : '')
+        + 'Held by the runtime is measured for the whole board, including other programs on the accelerator, and is not always released when a model is unloaded.');
+    }
+    if (list) parts.push(`${list} (estimated from each model’s accelerator files).`);
+    if (claimed == null) parts.push('The memory the runtime holds could not be read, so only the estimate is shown; other programs on the accelerator are not counted.');
+    note.textContent = parts.join(' ');
   }
 }
 
@@ -4316,7 +4351,9 @@ function openActiveModelMenu(anchor) {
     const mem = document.createElement('span');
     mem.className = 'active-model-menu-mem';
     mem.textContent = `MLA memory ${mlaMemorySummary()}`;
-    mem.title = 'Estimated from the loaded models; other programs on the accelerator are not counted';
+    mem.title = (_mlaMemory && typeof _mlaMemory.claimedBytes === 'number')
+      ? 'Held by the accelerator runtime, for every program on the board'
+      : 'Estimated from the loaded models; other programs on the accelerator are not counted';
     head.appendChild(mem);
   }
   menu.appendChild(head);

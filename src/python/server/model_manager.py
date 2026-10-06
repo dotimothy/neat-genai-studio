@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 import urllib.error
@@ -103,13 +104,11 @@ MAX_RESIDENT_LIMIT = 8
 _RESERVED_MEMORY_DIR = Path("/proc/device-tree/reserved-memory")
 
 
-def mla_pool_bytes(base: Path = _RESERVED_MEMORY_DIR) -> int | None:
-    """Size of the accelerator's model-memory pool, or None when unknown.
+def mla_pool_regions(base: Path = _RESERVED_MEMORY_DIR) -> list[tuple[int, int]]:
+    """(address, size) of each region of the accelerator's model-memory pool.
 
     On Modalix this memory is a reserved region (``dms@...``) outside the RAM
     Linux manages, so it shows up in neither ``free`` nor ``/proc/meminfo``.
-    The device tree gives its size; nothing on the board reports how much of it
-    is in use (see ``ModelManager.mla_memory``).
     """
     def _cells(name: str, default: int) -> int:
         try:
@@ -120,18 +119,94 @@ def mla_pool_bytes(base: Path = _RESERVED_MEMORY_DIR) -> int | None:
     try:
         nodes = sorted(n for n in base.iterdir() if n.name.startswith("dms"))
     except OSError:
-        return None
+        return []
     addr_cells, size_cells = _cells("#address-cells", 2), _cells("#size-cells", 2)
-    total = 0
+    regions = []
     for node in nodes:
         try:
             reg = (node / "reg").read_bytes()
         except OSError:
             continue
         start = addr_cells * 4
+        addr = int.from_bytes(reg[:start], "big")
         size = int.from_bytes(reg[start:start + size_cells * 4], "big")
-        total += size
-    return total or None
+        if size:
+            regions.append((addr, size))
+    return regions
+
+
+def mla_pool_bytes(base: Path = _RESERVED_MEMORY_DIR) -> int | None:
+    """Size of the accelerator's model-memory pool, or None when unknown."""
+    return sum(size for _addr, size in mla_pool_regions(base)) or None
+
+
+def claimed_from_maps(maps_text: str, regions: list[tuple[int, int]]) -> int:
+    """Pool memory a process has mapped, from its ``/proc/<pid>/maps``.
+
+    Counts the ``/dev/simaai-mem`` mappings whose offset (a physical address)
+    lies inside the pool; each distinct piece once, however often it is mapped.
+    """
+    seen = set()
+    for line in maps_text.splitlines():
+        parts = line.split()
+        if len(parts) < 6 or not parts[5].endswith("simaai-mem"):
+            continue
+        try:
+            lo, hi = (int(x, 16) for x in parts[0].split("-"))
+            offset = int(parts[2], 16)
+        except ValueError:
+            continue
+        if any(addr <= offset < addr + size for addr, size in regions):
+            seen.add((offset, hi - lo))
+    return sum(size for _offset, size in seen)
+
+
+# The process that owns accelerator memory on behalf of every client.
+_MLA_DISPATCHER_COMM = "mlashmcomplex"
+
+
+def _dispatcher_pid() -> int | None:
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/comm", encoding="utf-8") as fh:
+                if fh.read().strip() == _MLA_DISPATCHER_COMM:
+                    return int(entry)
+        except OSError:
+            continue
+    return None
+
+
+def read_dispatcher_maps() -> str | None:
+    """The dispatcher's memory map, or None when it cannot be read.
+
+    The dispatcher runs as root, so its map is readable directly only when
+    this process is root too; otherwise passwordless ``sudo`` is tried (the
+    same privilege Reset MLA relies on). ``STUDIO_MLA_MEMORY_SUDO=0`` turns
+    that off, and the meter then shows the per-model estimate only.
+    """
+    pid = _dispatcher_pid()
+    if pid is None:
+        return None
+    path = f"/proc/{pid}/maps"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        pass
+    if os.environ.get("STUDIO_MLA_MEMORY_SUDO", "1") == "0" or not shutil.which("sudo"):
+        return None
+    try:
+        out = subprocess.run(["sudo", "-n", "cat", path], capture_output=True,
+                             text=True, timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout if out.returncode == 0 and out.stdout else None
 
 
 _MLA_FAILURE_MARKERS = (
@@ -213,8 +288,10 @@ class ModelManager:
         self._resident: list[str] = []
         # Catalog by served name -> classification dict (name, path, type, ...).
         self._catalog: dict[str, dict] = {}
-        # Size of the accelerator's memory pool, read once on first use.
-        self._mla_total: int | None = None
+        # The accelerator's memory pool (read once on first use) and how much
+        # of it the dispatcher holds: (read at, value, seconds to keep it).
+        self._mla_regions: list[tuple[int, int]] | None = None
+        self._mla_claimed_cache: tuple[float, int | None, float] = (float("-inf"), None, 0.0)
         # On-disk weight size per model dir (cached; dirs are static once present).
         self._size_cache: dict[str, int] = {}
         # Weight-completeness per model dir (cached; cleared on each rescan).
@@ -425,27 +502,50 @@ class ModelManager:
         return state
 
     def mla_memory(self) -> dict:
-        """Accelerator memory: the pool's size and an estimate of what the
-        models this server has loaded take up.
+        """Accelerator memory: the pool's size, how much of it the runtime is
+        holding, and an estimate of what the models loaded here take up.
 
-        The board has no counter for memory in use, so the figure is the size
-        of each loaded model's ELF stages, which is what gets transferred to
-        the accelerator. It covers chat/VLM and speech-to-text models loaded
-        here; other programs using the accelerator are not visible to us.
+        ``claimedBytes`` is measured: the pool memory the MLA dispatcher has
+        mapped, for every program on the board. It is what decides whether
+        another model fits, and it is not always handed back when models are
+        unloaded (Reset MLA releases it). None when the dispatcher's memory map
+        cannot be read.
+
+        ``usedBytes`` / ``models`` are an estimate: the size of each loaded
+        model's ELF stages, which is what gets transferred to the accelerator.
+        The board has no per-model counter.
         """
-        if self._mla_total is None:
-            self._mla_total = mla_pool_bytes() or 0
+        if self._mla_regions is None:
+            self._mla_regions = mla_pool_regions()
+        total = sum(size for _addr, size in self._mla_regions)
         models: dict[str, int] = {}
         for name in self._server_model_names():
             size = self._elf_bytes(self.resolved_model_path(name))
             if size:
                 models[name] = size
         return {
-            "totalBytes": self._mla_total or None,
+            "totalBytes": total or None,
+            "claimedBytes": self._mla_claimed_bytes(),
             "usedBytes": sum(models.values()),
             "models": models,
             "estimated": True,
         }
+
+    def _mla_claimed_bytes(self) -> int | None:
+        """Pool memory held by the dispatcher, cached briefly: status is polled
+        about once a second during a load and this may shell out to sudo."""
+        if not self._mla_regions:
+            return None
+        now = time.monotonic()
+        cached_at, value, ttl = self._mla_claimed_cache
+        if now - cached_at < ttl:
+            return value
+        maps = read_dispatcher_maps()
+        value = claimed_from_maps(maps, self._mla_regions) if maps is not None else None
+        # Back off for a minute when it cannot be read, rather than retrying
+        # sudo on every poll.
+        self._mla_claimed_cache = (now, value, 4.0 if value is not None else 60.0)
+        return value
 
     def set_max_resident(self, limit) -> dict:
         """Change how many chat/VLM models may be resident at once.
@@ -645,7 +745,18 @@ class ModelManager:
                 # add_model returns the name the server actually served it under,
                 # which may differ from the requested one — that is the truth.
                 self._log_note(f"Registering {name} with the runtime…")
-                served = self._server.add_model(str(path), name)
+                try:
+                    served = self._server.add_model(str(path), name)
+                except Exception as exc:  # noqa: BLE001 - classified below
+                    # Current runtimes transfer the weights inside add_model,
+                    # so an accelerator failure surfaces here rather than at
+                    # the warm-up; give it the same rollback and guidance.
+                    if _is_mla_failure(str(exc)):
+                        if is_asr:
+                            with self._lock:
+                                self._active_asr = None
+                        return self._handle_mla_failure(name, str(exc))
+                    raise
                 self._log_note(
                     f"Registered {served}; transferring weights to the accelerator…"
                 )
@@ -1493,6 +1604,15 @@ class ModelManager:
                 f" It was loading alongside {', '.join(still_resident)}, which "
                 "is still loaded: unload a model first if they do not all fit "
                 "in accelerator memory together."
+            )
+        # Say so when the pool itself is the likely reason.
+        self._mla_claimed_cache = (float("-inf"), None, 0.0)   # re-read now
+        memory = self.mla_memory()
+        total, claimed = memory.get("totalBytes"), memory.get("claimedBytes")
+        if total and claimed and claimed >= 0.9 * total:
+            shared += (
+                f" The accelerator's memory pool is nearly full: the runtime is "
+                f"holding {claimed / 2**30:.1f} of {total / 2**30:.1f} GB."
             )
         raise RuntimeError(
             f"Model '{name}' could not be loaded: the accelerator (MLA) reported "
