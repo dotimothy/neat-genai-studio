@@ -1226,8 +1226,8 @@ def browse_and_download(ctrl, config_path, oai=None):
         print(f"{OK}✔ downloaded {len(downloaded)}/{total}: {', '.join(downloaded)}{RESET}")
         if failed:
             print(f"{ERR}  failed: {', '.join(failed)}{RESET}")
-        print(f"{MUTED}  loading {downloaded[0]} (only one model is resident; "
-              f"/load to switch).{RESET}")
+        print(f"{MUTED}  loading {downloaded[0]} (/load to load or switch to "
+              f"another).{RESET}")
     first = downloaded[0]
     return first if load_model(ctrl, first, oai=oai) else None
 

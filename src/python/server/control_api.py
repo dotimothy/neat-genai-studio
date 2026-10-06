@@ -72,7 +72,8 @@ class _ControlHandler(BaseHTTPRequestHandler):
                 after = int((query.get("after", ["0"])[0]) or 0)
                 self._send_json(self.manager.load_logs(after))
             elif path == "/control/catalog":
-                self._send_json({"catalog": self.manager.scan_catalog()})
+                catalog = self.manager.scan_catalog()
+                self._send_json(dict(self.manager.residency(), catalog=catalog))
             elif path == "/control/card":
                 name = (query.get("name", [""])[0])
                 self._send_json(self.manager.model_card(name))
@@ -100,7 +101,12 @@ class _ControlHandler(BaseHTTPRequestHandler):
             elif path == "/control/reset_mla":
                 self._send_json(self.manager.reset_mla())
             elif path == "/control/rescan":
-                self._send_json({"catalog": self.manager.scan_catalog()})
+                catalog = self.manager.scan_catalog()
+                self._send_json(dict(self.manager.residency(), catalog=catalog))
+            elif path == "/control/max_resident":
+                self._send_json(self.manager.set_max_resident(body.get("limit")))
+            elif path == "/control/touch":
+                self._send_json(self.manager.touch(str(body.get("name", ""))))
             elif path == "/control/benchmark":
                 self._send_json(self.manager.benchmark_start(
                     num_samples=body.get("num_samples", 5),

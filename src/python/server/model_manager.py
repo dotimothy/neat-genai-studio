@@ -3,9 +3,10 @@
 
 Wraps a live ``pyneat.GenAIServer`` so chat/VLM models can be loaded and
 unloaded on the fly (no restart), scans an on-disk catalog of compatible
-models, keeps a bounded set resident in RAM (LRU eviction), and can download
-additional compatible models from the Hugging Face Hub when the board is
-online.
+models, keeps a bounded set resident on the accelerator (least-recently-used
+eviction once the limit is reached; the limit can be changed at runtime), and
+can download additional compatible models from the Hugging Face Hub when the
+board is online.
 
 pyneat's ``add_model`` / ``remove_model`` are thread-safe and may be called
 after ``server.start()``; this class serializes catalog mutations under a lock.
@@ -92,6 +93,11 @@ _ASR_WARM_TIMEOUT_S = 300
 # all, which is exactly when a user is most likely to be watching.
 _DEFAULT_SEC_PER_GB = 2.7
 
+# Ceiling for the runtime-adjustable resident-model limit. The accelerator's
+# memory, not this number, is what really bounds how many models fit; this only
+# stops a typo from asking for an absurd count.
+MAX_RESIDENT_LIMIT = 8
+
 _MLA_FAILURE_MARKERS = (
     "mlashm",
     "mla_load",
@@ -138,7 +144,7 @@ class ModelManager:
     ) -> None:
         self._server = server
         self._catalog_dir = Path(catalog_dir) if catalog_dir else None
-        self._max_resident = max(1, int(max_resident_chat_models))
+        self._max_resident = min(MAX_RESIDENT_LIMIT, max(1, int(max_resident_chat_models)))
         # What config pins at startup (immutable) vs what serves transcriptions
         # right now (mutable — the UI can switch it). The active name is only a
         # cache: eviction victims are DERIVED from the server's loaded set, so a
@@ -360,23 +366,70 @@ class ModelManager:
                 if name not in asr and name not in self._resident:
                     self._resident.append(name)
 
-    def touch(self, name: str) -> None:
-        """Mark a resident model most-recently-used."""
+    def touch(self, name: str) -> dict:
+        """Mark a resident model most-recently-used (it is evicted last)."""
+        name = (name or "").strip()
         with self._lock:
             if name in self._resident:
                 self._resident.remove(name)
                 self._resident.insert(0, name)
+        return self.residency()
+
+    def residency(self) -> dict:
+        """Chat/VLM models resident now (most recently used first) and the limit."""
+        with self._lock:
+            return {
+                "resident": list(self._resident),
+                "maxResident": self._max_resident,
+                "maxResidentLimit": MAX_RESIDENT_LIMIT,
+            }
+
+    def set_max_resident(self, limit) -> dict:
+        """Change how many chat/VLM models may be resident at once.
+
+        Lowering the limit below the current residency unloads the least
+        recently used models straight away, so the reported limit is never a
+        promise the accelerator is not keeping.
+        """
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            raise ValueError("The resident-model limit must be a whole number") from None
+        if not 1 <= limit <= MAX_RESIDENT_LIMIT:
+            raise ValueError(
+                f"The resident-model limit must be between 1 and {MAX_RESIDENT_LIMIT}"
+            )
+        evicted: list[str] = []
+        with self._op_lock:
+            self._sync_resident_from_server()
+            with self._lock:
+                self._max_resident = limit
+                victims = self._resident[limit:]
+            for victim in victims:
+                self._stop_model_streams(victim)
+                if not self._server.remove_model(victim):
+                    raise RuntimeError(
+                        f"Could not unload '{victim}' to honour the new limit: "
+                        "the runtime reported it was not removed"
+                    )
+                evicted.append(victim)
+                with self._lock:
+                    if victim in self._resident:
+                        self._resident.remove(victim)
+        return dict(self.residency(), evicted=evicted)
 
     # -- load / unload ---------------------------------------------------------
 
     def load(self, name: str) -> dict:
-        """Load a model, clearing every other chat/VLM model first.
+        """Load a model, making room for it within the resident limit.
 
-        Only one chat/VLM model is kept resident at a time. Switching evicts the
-        others cleanly (cancel their in-flight streams, then unload, then wait so
-        the MLA memory is actually returned before the new model loads), then
-        warms the new model synchronously so an MLA load failure is caught here
-        and surfaced during the load rather than on the user's first chat.
+        Up to ``max_resident_chat_models`` chat/VLM models stay resident. When
+        the new model would exceed that, the least recently used ones are
+        evicted cleanly first (cancel their in-flight streams, then unload,
+        then wait so the MLA memory is actually returned before the new model
+        loads). With the default limit of 1 that is every other chat model. The
+        new model is then warmed synchronously so an MLA load failure is caught
+        here and surfaced during the load rather than on the user's first chat.
         """
         name = (name or "").strip()
         with self._op_lock:
@@ -456,8 +509,12 @@ class ModelManager:
             if is_asr:
                 victims = [v for v in self._loaded_asr_names() if v != name]
             else:
+                # Keep the most recently used models that still fit beside the
+                # new one; everything older is evicted to make room.
+                self._sync_resident_from_server()
                 with self._lock:
-                    victims = [v for v in self._resident if v != name]
+                    others = [v for v in self._resident if v != name]
+                    victims = others[max(0, self._max_resident - 1):]
 
             size_bytes = self._size_of(path)
             # Estimate and learn against the ELF bytes actually transferred, so
@@ -483,7 +540,7 @@ class ModelManager:
                 + (f", est {self._loading['estTotalS']:.0f}s" if self._loading.get("estTotalS") else "")
             )
             try:
-                # Clear every other chat/VLM model. _stop_model_streams (an HTTP
+                # Evict what no longer fits. _stop_model_streams (an HTTP
                 # /stop) and remove_model (which triggers the outgoing model's RAII
                 # free of MLA memory) can each block for seconds — do them WITHOUT
                 # holding _lock so status polls stay responsive during the switch.
@@ -497,27 +554,28 @@ class ModelManager:
                         if not self._server.remove_model(victim):
                             raise RuntimeError("the runtime reported it was not removed")
                         evicted.append(victim)
+                        with self._lock:
+                            if victim in self._resident:
+                                self._resident.remove(victim)
                     except Exception as exc:
                         # Whichever slot: if the outgoing model will not free,
-                        # adding the replacement leaves two resident (which can
-                        # fail the load outright on double residency) and the
-                        # state below would drop the old one from `_resident` /
-                        # `_active_asr`, making it invisible to every later
-                        # eviction. Abort with everything untouched.
+                        # adding the replacement leaves more resident than the
+                        # limit allows (which can fail the load outright) and
+                        # the state below would drop the old one from
+                        # `_resident` / `_active_asr`, making it invisible to
+                        # every later eviction. Abort, keeping it tracked.
                         kind = "speech-to-text" if is_asr else "chat"
                         raise RuntimeError(
                             f"Could not unload the current {kind} model "
                             f"'{victim}': {exc}"
                         ) from exc
-                with self._lock:
-                    if is_asr:
+                if is_asr:
+                    with self._lock:
                         # Honest during the eviction window: nothing can serve a
                         # transcription until the replacement is registered.
                         self._active_asr = None
-                    else:
-                        self._resident = []
-                # Let the free complete before loading the replacement, so the
-                # old and new model are never briefly co-resident.
+                # Let the free complete before loading the replacement, so an
+                # evicted model and the new one are never briefly co-resident.
                 if evicted and self._switch_settle_s:
                     time.sleep(self._switch_settle_s)
 
@@ -540,7 +598,9 @@ class ModelManager:
                     if is_asr:
                         self._active_asr = served
                     else:
-                        self._resident = [served]
+                        self._resident = [served] + [
+                            v for v in self._resident if v not in (served, name)
+                        ]
 
                 # add_model only registers; the real MLA load is deferred to first
                 # inference. Warm synchronously so a load failure is catchable and
@@ -600,12 +660,13 @@ class ModelManager:
                     return self._handle_mla_failure(name, detail)
 
                 # Non-MLA warm failure: roll back so manager state stays consistent.
+                # Only the model that failed goes; the others are still resident.
                 try:
                     self._server.remove_model(name)
                 except Exception:
                     pass
                 with self._lock:
-                    self._resident = []
+                    self._resident = [v for v in self._resident if v != name]
                 self._record_error(name, detail, kind="load")
                 raise RuntimeError(f"Model '{name}' failed to load: {detail}")
             finally:
@@ -1358,16 +1419,24 @@ class ModelManager:
         except Exception:
             pass
         with self._lock:
-            if name in self._resident:
-                self._resident = []
+            # Only the failed model is rolled back; any others stay resident.
+            self._resident = [v for v in self._resident if v != name]
+            still_resident = list(self._resident)
             if name == self._active_asr:
                 self._active_asr = None
+        shared = ""
+        if still_resident:
+            shared = (
+                f" It was loading alongside {', '.join(still_resident)}, which "
+                "is still loaded: unload a model first if they do not all fit "
+                "in accelerator memory together."
+            )
         raise RuntimeError(
             f"Model '{name}' could not be loaded: the accelerator (MLA) reported "
-            "an error. Accelerator memory is not always reclaimed when models are "
-            "switched, so this can follow several switches even when the model "
-            "fits on its own. Use 'Reset MLA' in Settings -> Models (or /reset in "
-            "the CLI) to clear the accelerator, then load it again."
+            f"an error.{shared} Accelerator memory is not always reclaimed when "
+            "models are switched, so this can follow several switches even when "
+            "the model fits on its own. Use 'Reset MLA' in Settings -> Models (or "
+            "/reset in the CLI) to clear the accelerator, then load it again."
         )
 
     # -- status ----------------------------------------------------------------
@@ -1403,7 +1472,9 @@ class ModelManager:
         return {
             "catalog": self.catalog(),
             "loaded": self._server_model_names(),
-            "maxResident": self._max_resident,
+            # Chat/VLM models resident now, most recently used first, and how
+            # many may be resident before the oldest is evicted.
+            **self.residency(),
             # The ASR model serving transcriptions now, and the one a restart
             # re-selects from config (they differ after a runtime switch).
             "asrModel": self._active_asr,

@@ -1147,6 +1147,8 @@ class AppContext:
         self.ui_font_family = "Inter"
         self.ui_font_size = 15
         self._catalog_names_cache = (0.0, frozenset())
+        # Vision support per catalog model, refreshed with the names above.
+        self._catalog_vision = {}
         self._asr_name_cache = (0.0, "")
 
         # Conversation history for OpenAI-style chat
@@ -1326,11 +1328,30 @@ class AppContext:
                 f"{self.control_base_url.rstrip('/')}/control/status", timeout=5
             )
             data = resp.json()
-            names = frozenset(entry.get("name", "") for entry in data.get("catalog", []))
+            catalog = data.get("catalog", [])
+            names = frozenset(entry.get("name", "") for entry in catalog)
+            self._catalog_vision = {
+                entry.get("name", ""): bool(entry.get("supportsVision"))
+                for entry in catalog if entry.get("type") != "asr"
+            }
         except Exception:
             names = frozenset()
         self._catalog_names_cache = (time.monotonic(), names)
         return names
+
+    def model_supports_vision(self, model_name):
+        """False only when the model is known to be text-only.
+
+        With several models loaded the conversation can move from a vision
+        model to a text-only one, and the earlier turns still carry their
+        images. An unknown model keeps the previous behaviour (treated as
+        vision-capable, so nothing is stripped).
+        """
+        caps = self.chat_model_capabilities.get(model_name)
+        if caps is not None:
+            return bool(caps.get("supportsVision"))
+        self._known_catalog_names()
+        return self._catalog_vision.get(model_name, True)
 
     def set_asr_model_name(self, name):
         """Point transcription at a new ASR model after a successful switch."""
@@ -1999,6 +2020,20 @@ class AppContext:
         def models_unload():
             name = (request.get_json(silent=True) or {}).get('name', '')
             return _proxy_control('POST', '/control/unload', 60, {'name': name})
+
+        @self.app.route('/models/max-resident', methods=['POST'])
+        def models_max_resident():
+            # How many chat/VLM models stay loaded together. Lowering it can
+            # unload models, which frees accelerator memory and may block.
+            limit = (request.get_json(silent=True) or {}).get('limit')
+            return _proxy_control('POST', '/control/max_resident', 120, {'limit': limit})
+
+        @self.app.route('/models/active', methods=['POST'])
+        def models_active():
+            # The model the chat is pointed at: mark it most recently used so
+            # it is the last one evicted when another model needs the room.
+            name = (request.get_json(silent=True) or {}).get('name', '')
+            return _proxy_control('POST', '/control/touch', 10, {'name': name})
 
         @self.app.route('/models/delete', methods=['POST'])
         def models_delete():
@@ -3104,11 +3139,33 @@ def _normalize_openai_image_parts(payload):
                     content[i] = {'type': 'image', 'image': url}
 
 
+def _strip_image_parts(messages):
+    """Copy of ``messages`` without image parts, for a text-only model.
+
+    Leaves the stored history untouched: switching back to a vision model
+    sends the images again.
+    """
+    stripped = []
+    for message in messages:
+        content = message.get('content') if isinstance(message, dict) else None
+        if isinstance(content, list):
+            parts = [
+                part for part in content
+                if not (isinstance(part, dict) and part.get('type') in ('image', 'image_url'))
+            ]
+            if len(parts) != len(content):
+                message = dict(message, content=parts or [{"type": "text", "text": ""}])
+        stripped.append(message)
+    return stripped
+
+
 def stream_chat_request(messages, model, config, generation_id, socketio_event='update', gen_params=None):
     """
     Streams chat completions from backend to frontend, handling TTS and history.
     """
     gen_params = gen_params or {}
+    if genai_app is not None and not genai_app.model_supports_vision(model):
+        messages = _strip_image_parts(messages)
     url = f"http://{config['SIMAAI_IP_ADDR']}/v1/chat/completions"
     no_think = bool(gen_params.get('no_think'))
     payload = {

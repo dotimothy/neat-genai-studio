@@ -23,7 +23,7 @@ The Studio starts without a chat model loaded. From the web interface you can:
 
 - find compatible models already on the device
 - download models from the supported Hugging Face accounts when the device is online
-- load one language or vision-language model at a time without restarting the Studio
+- load language or vision-language models without restarting the Studio: one at a time by default, or several side by side
 - chat with text, uploaded images, a browser camera, or a camera attached to the board
 - transcribe speech with Whisper, speak replies with the installed voices, and search local documents with RAG
 
@@ -149,8 +149,11 @@ Other useful environment variables:
   catalog, e.g. `florianvoss/whisper-medium-a16w8-layered-encoder`, so you can
   switch between them
   at runtime from **Settings → Models**.
-- `MAX_RESIDENT_CHAT_MODELS`: kept for advanced use; by default only one
-  chat/VLM model is resident and loading a new one clears the others.
+- `MAX_RESIDENT_CHAT_MODELS`: how many chat/VLM models stay loaded together
+  (default `1`: loading a model unloads the one already loaded). It is the
+  value the Studio starts with; **Settings → Models → Keep loaded** changes it
+  while the Studio runs. See
+  [Keep several models loaded](#keep-several-models-loaded).
 - `ALLOW_HUB_DOWNLOAD`: `true`/`false` to enable/disable in-UI Hugging Face
   downloads (default `true`).
 - `HUB_ORGS`: space-separated Hugging Face accounts the in-UI browser searches
@@ -470,12 +473,14 @@ plain HTTP behind another service):
 
 ```text
 GET  /health                       readiness: model server, active ASR model, loaded chat models, TTS engines
-POST /v1/chat/completions          OpenAI chat (streaming), proxied to the loaded chat/VLM model
+POST /v1/chat/completions          OpenAI chat (streaming), proxied to the loaded chat/VLM model named in "model"
 POST /v1/audio/speech              text to speech (see the audio API above)
 GET  /v1/audio/voices              engines, voices and languages
 POST /v1/audio/transcriptions      speech to text in the spoken language
 POST /v1/audio/translations        speech to English text
 GET  /models/status, /models/catalog; POST /models/load, /models/unload, /models/asr, ...
+POST /models/max-resident {"limit": n}   how many chat/VLM models stay loaded together
+POST /models/active {"name": "..."}      mark a loaded model most recently used (evicted last)
 GET/POST /tts/engine; GET /supertonic/voices, /piperplus/voices, /voices; POST /supertonic/select, /piperplus/select, /voices/select   voice settings
 POST /shutdown                     stop everything (not reachable cross-origin)
 ```
@@ -519,10 +524,12 @@ take a full base URL (`http://…` when `app.web.https` is false) or `STUDIO_URL
 ### Switch models on the fly
 The **Settings → Models** tab shows models downloaded to the board in a searchable list. Loaded models are marked
 `● loaded`, on-disk ones `○ downloaded`; press **Load** on a not-yet-loaded model
-to load it at runtime and unload all other chat/VLM models (speech-to-text has
-its own slot and is untouched), so the MLA holds just the active model. A **Load status** panel pins to the
+to load it at runtime. By default that unloads the chat/VLM model already loaded
+(speech-to-text has its own slot and is untouched), so the MLA holds just the
+active model; raise **Keep loaded** to hold several instead (see
+[Keep several models loaded](#keep-several-models-loaded)). A **Load status** panel pins to the
 top of the tab and shows the live progress bar while it loads. The studio cancels
-the outgoing model's in-flight generation and waits for its memory to be released
+an outgoing model's in-flight generation and waits for its memory to be released
 before loading the new one, then warms it so your first message is instant.
 
 <p align="center">
@@ -532,6 +539,41 @@ before loading the new one, then warms it so your first message is instant.
 If a switch hits an accelerator error, the Studio rolls back the failed model
 registration and reports the error. It does not restart or reset board services
 on its own — use **Reset MLA** below if the accelerator is genuinely wedged.
+
+### Keep several models loaded
+**Settings → Models → Keep loaded** sets how many chat/VLM models stay on the
+accelerator together (1 to 4 in the UI; the control API accepts up to 8). With
+it above 1, **Load** adds a model next to the ones already loaded. Loading one
+more than the limit unloads the least recently used model first, and lowering
+the limit unloads down to it straight away. Speech-to-text keeps its own slot
+and never counts.
+
+All loaded models share accelerator memory, so how many fit depends on their
+size, not on this number. A model that does not fit fails to load with the
+accelerator error; the models already loaded stay loaded, and the error names
+them so you can unload one and try again.
+
+With two or more loaded:
+
+- **Pick who answers.** The model pill in the header (and the indicator on the
+  home screen) opens a menu of the loaded models; each loaded row in
+  **Settings → Models** also has a **Use** button. Switching is instant, since
+  nothing is loaded or unloaded, and the conversation carries over. Each reply
+  is tagged with the model that wrote it. Images from earlier turns are left out
+  of requests to a text-only model and sent again when you switch back.
+- **Compare side by side.** The two-column button in the header (also in the
+  model menu) opens **Compare**: type one prompt and every loaded model answers
+  in its own column at the same time, each with its first-token time, tokens
+  per second, token count and total time, plus the combined rate. Untick
+  **Run at the same time** to run them one after another instead. Comparisons
+  are sent without the chat history or system prompt and do not touch the chat.
+- **Use them from the API.** Every loaded model is served by the
+  OpenAI-compatible endpoint at once; name the one you want in `model`, and
+  send requests to different models in parallel.
+
+The choice lasts until the Studio restarts.
+`server.models.max_resident_chat_models` in `config.local.yaml` (or
+`MAX_RESIDENT_CHAT_MODELS` at setup) is the value it starts with.
 
 ### Switch the speech-to-text model
 The same tab lists your speech-to-text (ASR) models in their own
@@ -948,6 +990,13 @@ curl -s http://127.0.0.1:9997/control/load \
 curl -s http://127.0.0.1:9997/control/unload \
   -H 'Content-Type: application/json' \
   -d '{"name":"<catalog-model-name>"}' | python3 -m json.tool
+
+# Keep two chat/VLM models loaded together (until the studio restarts). The
+# status above reports the limit as "maxResident" and the loaded chat models,
+# most recently used first, as "resident".
+curl -s http://127.0.0.1:9997/control/max_resident \
+  -H 'Content-Type: application/json' \
+  -d '{"limit":2}' | python3 -m json.tool
 
 # Make another speech-to-text model active (evicts the previous one). The
 # status above reports the active one as "asrModel" and the one a restart

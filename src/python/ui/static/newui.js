@@ -87,6 +87,15 @@ function getChatModelCapabilities() {
 // The dropdown is only a *selection* that the Load button acts on, so it can
 // differ from the active model while the user browses the catalog.
 let _activeChatModel = '';
+// How many chat/VLM models the server keeps loaded together, the ceiling it
+// accepts for that limit, and which models are loaded now (most recently used
+// first). All three come from the control API.
+let _maxResident = 1;
+let _maxResidentCap = 8;
+let _residentOrder = [];
+// The model the last chat request was sent to, for the per-reply model tag.
+let _lastRequestModel = '';
+const ACTIVE_MODEL_KEY = 'studioActiveChatModel';
 // Match the original Multimodal Assistant behavior: automatically enable image
 // prompting whenever a vision-capable model becomes active.
 let _visionPromptModel = '';
@@ -487,7 +496,9 @@ function initSettingsModal() {
   if (open1) open1.addEventListener('click', openSettings);
   if (open2) open2.addEventListener('click', openSettings);
   const homeInd = document.getElementById('homeModelIndicator');
-  if (homeInd) homeInd.addEventListener('click', openSettings);
+  if (homeInd) homeInd.addEventListener('click', (e) => onModelIndicatorClick(e, homeInd));
+  const headerPill = document.getElementById('headerModelPill');
+  if (headerPill) headerPill.addEventListener('click', (e) => onModelIndicatorClick(e, headerPill));
   if (close) close.addEventListener('click', closeSettings);
   if (modal) modal.addEventListener('click', (e) => { if (e.target === modal) closeSettings(); });
   document.addEventListener('keydown', (e) => {
@@ -833,6 +844,8 @@ window.onload = function () {
   initAttachToggle();
   initVision();
   initBenchmark();
+  initActiveModelMenu();
+  initCompare();
   initShowcase();
   initSolutions();
   initPlayground();
@@ -1666,7 +1679,8 @@ async function startProcessingInternal(resultMessage, textchat = null, waitForTr
 
   formData.append('searchRag', isRagEnabled() && searchRag ? searchRag.checked : false);
   formData.append('includeChatHistory', includeChatHistory ? includeChatHistory.checked : true);
-  formData.append('chatModel', getSelectedChatModel());
+  _lastRequestModel = getSelectedChatModel();
+  formData.append('chatModel', _lastRequestModel);
   formData.append('utteranceSpeed', getUtteranceSpeed().toFixed(2));
   formData.append('enableTts', isTtsEnabled());
   formData.append('maxTokens', getMaxTokens());
@@ -2473,7 +2487,13 @@ function setMessageTokens(messageEl, count) {
   const tpsEl = document.getElementById('tpsValue');
   const tps = tpsEl ? parseFloat(tpsEl.textContent) : NaN;
   const rate = Number.isFinite(tps) && tps > 0 ? ` · ${tps.toFixed(1)} tok/s` : '';
-  meta.textContent = `${count} token${count === 1 ? '' : 's'}${rate}`;
+  // With several models loaded, say which one wrote this reply. Kept on the
+  // element so a later switch does not relabel an earlier answer.
+  if (!meta.dataset.model && _lastRequestModel && loadedChatModels().length > 1) {
+    meta.dataset.model = _lastRequestModel;
+  }
+  const tag = meta.dataset.model ? ` · ${meta.dataset.model}` : '';
+  meta.textContent = `${count} token${count === 1 ? '' : 's'}${rate}${tag}`;
 }
 socket.on('ttfs', handleTtfsUpdate);
 socket.on('transcription-time', handleTranscriptionTimeUpdate);
@@ -4008,6 +4028,7 @@ async function refreshCatalog() {
     const data = await resp.json();
     if (!data || !Array.isArray(data.catalog)) throw new Error('malformed catalog');
     const catalog = data.catalog;
+    applyResidency(data);
     // Update capabilities so vision detection works for any catalog model.
     const caps = window.SIMA_CONFIG.chatModelCapabilities || {};
     catalog.forEach(m => {
@@ -4077,11 +4098,11 @@ function populateModelSelect(catalog) {
   }
   select.value = selection;
 
-  // Active model = the one actually resident. With the control API only one
-  // chat/VLM is loaded at a time; in static mode every model is preloaded so
-  // the active one follows the current selection.
+  // Active model = the loaded model the chat talks to. Several can be loaded
+  // at once, so the user's pick is kept while it stays loaded; in static mode
+  // every model is preloaded and the active one follows the current selection.
   if (controlEnabled()) {
-    _activeChatModel = loaded.includes(defaultModel) ? defaultModel : (loaded[0] || '');
+    _activeChatModel = pickActiveChatModel(loaded, defaultModel);
   } else {
     _activeChatModel = select.value || defaultModel || (chatModels[0] && chatModels[0].name) || '';
   }
@@ -4095,6 +4116,199 @@ function populateModelSelect(catalog) {
   updateActiveModelPill(_activeChatModel || '—');
   updateManageButtons();
   if (typeof updateSelectedModelVisionState === 'function') updateSelectedModelVisionState();
+}
+
+// Which loaded model the chat talks to: the user's pick while it is still
+// loaded, otherwise the most recently used one.
+function pickActiveChatModel(loaded, defaultModel) {
+  if (!loaded.length) return '';
+  if (loaded.includes(_activeChatModel)) return _activeChatModel;
+  let saved = '';
+  try { saved = localStorage.getItem(ACTIVE_MODEL_KEY) || ''; } catch (e) { /* private mode */ }
+  if (loaded.includes(saved)) return saved;
+  const recent = _residentOrder.find(n => loaded.includes(n));
+  if (recent) return recent;
+  return loaded.includes(defaultModel) ? defaultModel : loaded[0];
+}
+
+function loadedChatModels() {
+  return _catalog.filter(m => (m.type || 'chat') !== 'asr' && m.loaded);
+}
+
+// Static launches list models without per-entry capabilities; fall back to the
+// capability map published in the page config.
+function modelKindLabel(m) {
+  const caps = getChatModelCapabilities()[m.name];
+  const vision = m.supportsVision != null ? !!m.supportsVision : !!(caps && caps.supportsVision);
+  return vision ? 'VLM' : 'LLM';
+}
+
+// Point the chat at another loaded model. Nothing is loaded or unloaded and the
+// conversation carries over; the server is told so this model is evicted last.
+function setActiveChatModel(name) {
+  if (!name || name === getSelectedChatModel()) return;
+  if (!controlEnabled()) { selectInstalledModel(name); return; }
+  const entry = _catalog.find(m => m.name === name);
+  if (!entry || !entry.loaded) return;
+  _activeChatModel = name;
+  try { localStorage.setItem(ACTIVE_MODEL_KEY, name); } catch (e) { /* private mode */ }
+  fetch('/models/active', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name })
+  }).then(r => (r.ok ? r.json() : null))
+    .then(d => { if (d && Array.isArray(d.resident)) _residentOrder = d.resident.slice(); })
+    .catch(() => { /* ordering hint only */ });
+  updateActiveModelPill();
+  updateManageButtons();
+  if (typeof updateSelectedModelVisionState === 'function') updateSelectedModelVisionState();
+}
+
+function applyResidency(data) {
+  if (!data) return;
+  const limit = Number(data.maxResident);
+  if (Number.isFinite(limit) && limit >= 1) _maxResident = limit;
+  const cap = Number(data.maxResidentLimit);
+  if (Number.isFinite(cap) && cap >= 1) _maxResidentCap = cap;
+  if (Array.isArray(data.resident)) _residentOrder = data.resident.slice();
+  renderResidentLimit();
+}
+
+// The "Keep loaded" control in Settings → Models.
+function renderResidentLimit() {
+  const row = document.getElementById('modelResidentRow');
+  const sel = document.getElementById('modelMaxResident');
+  const note = document.getElementById('modelResidentNote');
+  if (!row || !sel) return;
+  row.style.display = controlEnabled() ? '' : 'none';
+  const top = Math.min(_maxResidentCap, Math.max(4, _maxResident));
+  if (sel.options.length !== top) {
+    sel.innerHTML = '';
+    for (let n = 1; n <= top; n++) {
+      const o = document.createElement('option');
+      o.value = String(n);
+      o.textContent = n === 1 ? '1 model' : `${n} models`;
+      sel.appendChild(o);
+    }
+  }
+  sel.value = String(_maxResident);
+  sel.disabled = serverBusy();
+  if (note) {
+    note.textContent = _maxResident > 1
+      ? `Up to ${_maxResident} chat models stay loaded together and share accelerator memory. Loading one more unloads the least recently used.`
+      : 'Loading a model unloads the one already loaded. Raise this to keep several loaded and switch between them from the chat.';
+  }
+}
+
+async function changeResidentLimit(limit) {
+  limit = Number(limit);
+  if (!Number.isFinite(limit) || limit === _maxResident || _modelBusy) { renderResidentLimit(); return; }
+  const loaded = loadedChatModels().length;
+  if (limit < loaded) {
+    const drop = loaded - limit;
+    if (!window.confirm(`Keeping ${limit} loaded will unload ${drop} model${drop === 1 ? '' : 's'} now, least recently used first. Continue?`)) {
+      renderResidentLimit();
+      return;
+    }
+  }
+  _modelBusy = true;
+  updateManageButtons();
+  setModelStatus('Updating how many models stay loaded…', 'loading');
+  try {
+    const resp = await fetch('/models/max-resident', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit })
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+    applyResidency(data);
+    const ev = Array.isArray(data.evicted) ? data.evicted : [];
+    setModelStatus(`Keeping up to ${_maxResident} model${_maxResident === 1 ? '' : 's'} loaded`
+      + (ev.length ? ` · unloaded ${ev.join(', ')}` : ''), 'muted');
+  } catch (err) {
+    setModelStatus(`Could not change the limit: ${err.message}`, 'error');
+  } finally {
+    _modelBusy = false;
+    await refreshCatalog();
+  }
+}
+
+// ---- Active-model menu (header pill + home indicator) ------------------
+// With one model loaded the indicators open Settings, as before. With several
+// they open a menu to pick which one the chat talks to.
+function onModelIndicatorClick(event, anchor) {
+  const menu = document.getElementById('activeModelMenu');
+  if (!menu || loadedChatModels().length < 2) { closeActiveModelMenu(); openSettings(); return; }
+  event.stopPropagation();
+  if (!menu.hidden && menu.dataset.anchor === anchor.id) { closeActiveModelMenu(); return; }
+  openActiveModelMenu(anchor);
+}
+
+function openActiveModelMenu(anchor) {
+  const menu = document.getElementById('activeModelMenu');
+  if (!menu) return;
+  const active = getSelectedChatModel();
+  menu.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'active-model-menu-head';
+  head.textContent = 'Chat with';
+  menu.appendChild(head);
+  loadedChatModels().forEach(m => {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'active-model-item' + (m.name === active ? ' is-active' : '');
+    item.setAttribute('role', 'menuitemradio');
+    item.setAttribute('aria-checked', m.name === active ? 'true' : 'false');
+    const kind = modelKindLabel(m);
+    item.innerHTML = `<span class="active-model-check" aria-hidden="true">${m.name === active ? '✓' : ''}</span>`
+      + `<span class="active-model-name">${escHtml(m.name)}</span>`
+      + `<span class="hub-badge hub-badge-${kind.toLowerCase()}">${kind}</span>`;
+    item.addEventListener('click', () => { closeActiveModelMenu(); setActiveChatModel(m.name); });
+    menu.appendChild(item);
+  });
+  const foot = document.createElement('div');
+  foot.className = 'active-model-menu-foot';
+  const compare = document.createElement('button');
+  compare.type = 'button'; compare.className = 'active-model-link';
+  compare.textContent = 'Compare side by side';
+  compare.addEventListener('click', () => { closeActiveModelMenu(); openCompare(); });
+  const manage = document.createElement('button');
+  manage.type = 'button'; manage.className = 'active-model-link';
+  manage.textContent = 'Manage models…';
+  manage.addEventListener('click', () => { closeActiveModelMenu(); openSettings(); });
+  foot.appendChild(compare); foot.appendChild(manage);
+  menu.appendChild(foot);
+
+  menu.hidden = false;
+  menu.dataset.anchor = anchor.id;
+  anchor.setAttribute('aria-expanded', 'true');
+  // Fixed-position under the anchor, kept inside the viewport.
+  const r = anchor.getBoundingClientRect();
+  const w = Math.max(260, Math.min(360, window.innerWidth - 24));
+  menu.style.width = `${w}px`;
+  let left = r.left + r.width / 2 - w / 2;
+  left = Math.max(12, Math.min(left, window.innerWidth - w - 12));
+  menu.style.left = `${left}px`;
+  menu.style.top = `${Math.min(r.bottom + 8, window.innerHeight - menu.offsetHeight - 12)}px`;
+}
+
+function closeActiveModelMenu() {
+  const menu = document.getElementById('activeModelMenu');
+  if (!menu || menu.hidden) return;
+  menu.hidden = true;
+  const anchor = document.getElementById(menu.dataset.anchor || '');
+  if (anchor) anchor.setAttribute('aria-expanded', 'false');
+  menu.dataset.anchor = '';
+}
+
+function initActiveModelMenu() {
+  document.addEventListener('click', (e) => {
+    const menu = document.getElementById('activeModelMenu');
+    if (menu && !menu.hidden && !menu.contains(e.target)) closeActiveModelMenu();
+  });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeActiveModelMenu(); });
+  window.addEventListener('resize', closeActiveModelMenu);
+  const sel = document.getElementById('modelMaxResident');
+  if (sel) sel.addEventListener('change', () => changeResidentLimit(sel.value));
 }
 
 // ---- Unified, searchable model list -----------------------------------
@@ -4184,6 +4398,7 @@ function renderInstalledList() {
   const control = controlEnabled();
   const busy = serverBusy();
   const activeName = control ? _activeChatModel : getSelectedChatModel();
+  const loadedCount = models.filter(m => m.loaded).length;
   filtered.forEach(m => {
     const incomplete = m.complete === false;
     const unsupported = m.supported === false;
@@ -4198,7 +4413,9 @@ function renderInstalledList() {
     const stateCls = incomplete ? 'is-incomplete' : (m.loaded ? 'is-loaded' : '');
     // "downloaded" (on disk, ready to load) vs "loaded" (in memory now) — never
     // "available", which reads like "available to download".
-    const stateTxt = incomplete ? '⚠ incomplete' : (m.loaded ? '● loaded' : '○ downloaded');
+    // With several loaded, also mark the one the chat is talking to.
+    const stateTxt = incomplete ? '⚠ incomplete'
+      : (m.loaded ? (isActive && loadedCount > 1 ? '● loaded · in chat' : '● loaded') : '○ downloaded');
     const badges = `<span class="hub-badge hub-badge-${t.toLowerCase()}">${t}</span>`
       + (size ? `<span class="hub-badge">${size}</span>` : '')
       + `<span class="hub-badge model-state ${stateCls}">${stateTxt}</span>`;
@@ -4220,6 +4437,15 @@ function renderInstalledList() {
       del.addEventListener('click', (e) => { e.stopPropagation(); deleteModel(m.name); });
       row.appendChild(del);
 
+      if (m.loaded && !isActive) {
+        const use = document.createElement('button');
+        use.className = 'setting-button model-action model-use'; use.type = 'button';
+        use.textContent = 'Use';
+        use.title = `Chat with ${m.name} (it stays loaded either way)`;
+        use.disabled = busy;
+        use.addEventListener('click', (e) => { e.stopPropagation(); setActiveChatModel(m.name); });
+        row.appendChild(use);
+      }
       const btn = document.createElement('button');
       btn.className = 'setting-button model-action'; btn.type = 'button';
       if (m.loaded) {
@@ -4282,14 +4508,22 @@ function updateActiveModelPill() {
   const pill = document.getElementById('headerModelPill');
   const nameEl = document.getElementById('headerModelName');
   const model = getSelectedChatModel();
+  const others = Math.max(0, loadedChatModels().length - 1);
   if (pill && nameEl) {
     if (model) {
       nameEl.textContent = model;
       pill.style.display = '';
+      pill.classList.toggle('has-menu', others > 0);
+      pill.title = others > 0 ? 'Active model — click to switch' : 'Active model — click to manage';
+      const count = document.getElementById('headerModelCount');
+      if (count) { count.textContent = others > 0 ? `+${others}` : ''; count.hidden = others === 0; }
     } else {
       pill.style.display = 'none';
     }
   }
+  const compareBtn = document.getElementById('compareButton');
+  if (compareBtn) compareBtn.style.display = others > 0 ? '' : 'none';
+  if (others === 0) closeActiveModelMenu();
   updateHomeModelIndicator();
 }
 
@@ -4302,10 +4536,12 @@ function updateHomeModelIndicator() {
   const model = getSelectedChatModel();
   if (model) {
     const vision = typeof selectedChatModelSupportsVision === 'function' && selectedChatModelSupportsVision();
-    nameEl.textContent = model + (vision ? '  ·  vision' : '');
+    const others = Math.max(0, loadedChatModels().length - 1);
+    nameEl.textContent = model + (vision ? '  ·  vision' : '')
+      + (others > 0 ? `  ·  +${others} loaded` : '');
     box.classList.add('loaded');
     box.classList.remove('empty');
-    box.title = 'Active model — click to change';
+    box.title = others > 0 ? 'Active model — click to switch' : 'Active model — click to change';
   } else {
     nameEl.textContent = 'No model loaded — choose one';
     box.classList.add('empty');
@@ -4323,6 +4559,7 @@ function updateManageButtons() {
   // reason. Only a reset already in flight disables it.
   const mlaReset = document.getElementById('mlaResetButton');
   if (mlaReset) mlaReset.disabled = _resetting;
+  renderResidentLimit();
   renderInstalledList();
   renderAsrList();
   updateComposerEnabled();
@@ -4885,11 +5122,17 @@ async function loadModelAndActivate(name) {
   updateManageButtons();
   clearModelError();
   await resetLoadLog();
-  // Loading a chat/VLM model evicts the currently-resident one — say so explicitly.
+  // Loading past the limit evicts the least recently used model(s) — say which.
   const resident = select
     ? Array.from(select.options).filter(o => o.dataset.loaded === 'true' && o.value !== name).map(o => o.value)
     : [];
-  const switchNote = resident.length ? `Unloading ${resident.join(', ')} — ` : '';
+  let switchNote = '';
+  if (resident.length > _maxResident - 1) {
+    const order = _residentOrder.filter(n => resident.includes(n));
+    const victims = order.length === resident.length ? order.slice(_maxResident - 1) : [];
+    switchNote = victims.length ? `Unloading ${victims.join(', ')} — `
+      : 'Unloading the least recently used model — ';
+  }
   setModelStatus(`${switchNote}Loading ${name}… preparing`, 'loading');
   setModelLoadBar('active');
   startLoadPolling(name);
@@ -4908,8 +5151,13 @@ async function loadModelAndActivate(name) {
     const secs = (typeof data.load_seconds === 'number') ? data.load_seconds : null;
     const timeNote = (secs != null && secs > 0) ? ` in ${secs.toFixed(1)}s` : '';
     setModelStatus(`Ready: ${name}${timeNote}${evictedNote}`, 'ready');
-    // A newly loaded model starts with a fresh context — clear the chat.
-    newChat();
+    // The new model takes over the chat. Kept before the catalog refresh below
+    // so the refresh does not fall back to the previously active model.
+    _activeChatModel = name;
+    try { localStorage.setItem(ACTIVE_MODEL_KEY, name); } catch (e) { /* private mode */ }
+    // A model that replaced the previous one starts with a fresh context. One
+    // loaded alongside others carries the conversation over, like a switch.
+    if (resident.length - ev.length <= 0) newChat();
   } catch (err) {
     setModelStatus('Load failed — see details below', 'error');
     showModelError(name, err.message);
@@ -6607,6 +6855,250 @@ function initBenchmark() {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && modal.style.display !== 'none') closeBenchmark();
   });
+}
+
+// ---- Compare: one prompt, every loaded model, side by side -------------
+// Each loaded chat/VLM model gets its own column and its own streamed request
+// through the same-origin /v1/chat/completions proxy, so the requests really
+// are in flight together. Nothing here touches the chat, its history or TTS.
+let _compareRunning = false;
+let _compareControllers = [];
+const _compareResults = {};   // model name -> { text, stats, state } of the last run
+
+function initCompare() {
+  const modal = document.getElementById('compareModal');
+  if (!modal) return;
+  const open = document.getElementById('compareButton');
+  const close = document.getElementById('compareCloseBtn');
+  const run = document.getElementById('compareRunBtn');
+  const stop = document.getElementById('compareStopBtn');
+  const prompt = document.getElementById('comparePrompt');
+  if (open) open.addEventListener('click', openCompare);
+  if (close) close.addEventListener('click', closeCompare);
+  if (run) run.addEventListener('click', runCompare);
+  if (stop) stop.addEventListener('click', stopCompare);
+  if (prompt) prompt.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runCompare(); }
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal.style.display === 'flex') closeCompare();
+  });
+}
+
+function openCompare() {
+  const modal = document.getElementById('compareModal');
+  if (!modal) return;
+  modal.style.display = 'flex';
+  document.body.classList.add('bench-open');
+  renderCompareColumns();
+  const prompt = document.getElementById('comparePrompt');
+  if (prompt) prompt.focus();
+}
+
+function closeCompare() {
+  const modal = document.getElementById('compareModal');
+  if (!modal) return;
+  stopCompare();
+  modal.style.display = 'none';
+  document.body.classList.remove('bench-open');
+}
+
+function compareFmt(n, digits) {
+  return Number.isFinite(n) ? n.toFixed(digits) : '—';
+}
+
+function compareSetStats(col, stats) {
+  const set = (k, v) => { const el = col.querySelector(`[data-k="${k}"]`); if (el) el.textContent = v; };
+  set('ttft', stats.ttftS != null ? `${compareFmt(stats.ttftS, 2)}s` : '—');
+  set('tps', stats.tps != null ? compareFmt(stats.tps, 1) : '—');
+  set('tokens', String(stats.tokens || 0));
+  set('time', stats.totalS != null ? `${compareFmt(stats.totalS, 1)}s` : '—');
+}
+
+function compareSetState(col, text, kind) {
+  const el = col.querySelector('.compare-col-state');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'compare-col-state' + (kind ? ` is-${kind}` : '');
+}
+
+// One column per loaded model. Rebuilt whenever the view opens or a run starts,
+// so it always reflects what is loaded now; a model's last answer is kept.
+function renderCompareColumns() {
+  const grid = document.getElementById('compareGrid');
+  const empty = document.getElementById('compareEmpty');
+  const run = document.getElementById('compareRunBtn');
+  if (!grid) return [];
+  const models = loadedChatModels();
+  grid.innerHTML = '';
+  grid.style.setProperty('--compare-cols', String(Math.max(1, Math.min(models.length, 4))));
+  if (empty) empty.style.display = models.length >= 2 ? 'none' : '';
+  if (run) run.disabled = _compareRunning || models.length < 1;
+  return models.map(m => {
+    const col = document.createElement('div');
+    col.className = 'compare-col';
+    col.dataset.model = m.name;
+    const kind = modelKindLabel(m);
+    col.innerHTML = `<div class="compare-col-head">`
+      + `<span class="compare-col-name" title="${escHtml(m.name)}">${escHtml(m.name)}</span>`
+      + `<span class="hub-badge hub-badge-${kind.toLowerCase()}">${kind}</span></div>`
+      + `<div class="compare-col-stats">`
+      + `<span><b data-k="ttft">—</b>first token</span>`
+      + `<span><b data-k="tps">—</b>tok/s</span>`
+      + `<span><b data-k="tokens">0</b>tokens</span>`
+      + `<span><b data-k="time">—</b>total</span></div>`
+      + `<div class="compare-col-body message-text"></div>`
+      + `<div class="compare-col-state"></div>`;
+    grid.appendChild(col);
+    const prev = _compareResults[m.name];
+    if (prev) {
+      renderMarkdownInto(col.querySelector('.compare-col-body'), prev.text);
+      compareSetStats(col, prev.stats);
+      compareSetState(col, prev.stateText, prev.stateKind);
+    }
+    return { model: m.name, col };
+  });
+}
+
+// Stream one model's answer into its column. First token and total are wall
+// clock from `t0` (so a request that had to wait its turn shows it); tok/s is
+// the runtime's own figure when it streams one, else derived from arrivals.
+async function compareRunOne(entry, prompt, maxTokens, t0) {
+  const { model, col } = entry;
+  const body = col.querySelector('.compare-col-body');
+  const controller = new AbortController();
+  _compareControllers.push(controller);
+  const stats = { ttftS: null, tps: null, tokens: 0, totalS: null };
+  let text = '';
+  let tFirst = null;
+  let tLast = null;
+  let srvTps = null;
+  const finish = (stateText, stateKind) => {
+    stats.totalS = (performance.now() - t0) / 1000;
+    if (srvTps != null) stats.tps = srvTps;
+    else if (tFirst != null && tLast > tFirst && stats.tokens > 1) {
+      stats.tps = (stats.tokens - 1) / ((tLast - tFirst) / 1000);
+    }
+    compareSetStats(col, stats);
+    compareSetState(col, stateText, stateKind);
+    renderMarkdownInto(body, text);
+    _compareResults[model] = { text, stats, stateText, stateKind };
+  };
+  body.innerHTML = '';
+  compareSetStats(col, stats);
+  compareSetState(col, 'Waiting for the first token…', 'busy');
+  col.classList.add('is-running');
+  try {
+    const resp = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model, stream: true, max_tokens: maxTokens,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+      signal: controller.signal,
+    });
+    if (!resp.ok || !resp.body) {
+      const detail = await resp.text().catch(() => '');
+      let message = `HTTP ${resp.status}`;
+      try { const j = JSON.parse(detail); message = (j.error && (j.error.message || j.error)) || message; } catch (e) { /* not JSON */ }
+      throw new Error(String(message));
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let done = false;
+    while (!done) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (data === '[DONE]') { done = true; break; }
+        let obj;
+        try { obj = JSON.parse(data); } catch (e) { continue; }
+        if (obj.error) throw new Error(String(obj.error.message || obj.error));
+        if (obj.tps != null && Number.isFinite(Number(obj.tps))) srvTps = Number(obj.tps);
+        const delta = obj.choices && obj.choices[0] && obj.choices[0].delta && obj.choices[0].delta.content;
+        if (!delta) continue;
+        const now = performance.now();
+        if (tFirst == null) {
+          tFirst = now;
+          stats.ttftS = (now - t0) / 1000;
+          compareSetState(col, 'Generating…', 'busy');
+        }
+        tLast = now;
+        stats.tokens += 1;
+        text += delta;
+        stats.totalS = (now - t0) / 1000;
+        if (srvTps != null) stats.tps = srvTps;
+        else if (stats.tokens > 1 && tLast > tFirst) stats.tps = (stats.tokens - 1) / ((tLast - tFirst) / 1000);
+        compareSetStats(col, stats);
+        renderMarkdownStreaming(body, text);
+        body.scrollTop = body.scrollHeight;
+      }
+    }
+    finish(stats.tokens ? 'Done' : 'No output', stats.tokens ? 'ok' : 'error');
+  } catch (err) {
+    if (err && err.name === 'AbortError') finish('Stopped', 'muted');
+    else finish(`Failed: ${err && err.message ? err.message : err}`, 'error');
+  } finally {
+    col.classList.remove('is-running');
+  }
+}
+
+async function runCompare() {
+  if (_compareRunning) return;
+  const promptEl = document.getElementById('comparePrompt');
+  const prompt = (promptEl && promptEl.value || '').trim();
+  const summary = document.getElementById('compareSummary');
+  if (!prompt) { if (promptEl) promptEl.focus(); return; }
+  const entries = renderCompareColumns();
+  if (!entries.length) return;
+  const tokensEl = document.getElementById('compareMaxTokens');
+  const maxTokens = Math.max(8, Math.min(2048, parseInt(tokensEl && tokensEl.value, 10) || 256));
+  const parallel = !!(document.getElementById('compareParallel') || {}).checked;
+  const run = document.getElementById('compareRunBtn');
+  const stop = document.getElementById('compareStopBtn');
+  _compareRunning = true;
+  _compareControllers = [];
+  if (run) run.style.display = 'none';
+  if (stop) stop.style.display = '';
+  if (summary) summary.textContent = parallel
+    ? `Running ${entries.length} model${entries.length === 1 ? '' : 's'} at the same time…`
+    : `Running ${entries.length} model${entries.length === 1 ? '' : 's'} one after another…`;
+  const started = performance.now();
+  try {
+    if (parallel) {
+      await Promise.all(entries.map(e => compareRunOne(e, prompt, maxTokens, started)));
+    } else {
+      for (const e of entries) {
+        if (!_compareRunning) break;
+        await compareRunOne(e, prompt, maxTokens, performance.now());
+      }
+    }
+  } finally {
+    const wall = (performance.now() - started) / 1000;
+    const total = entries.reduce((n, e) => n + ((((_compareResults[e.model] || {}).stats || {}).tokens) || 0), 0);
+    if (summary) summary.textContent = `${entries.length} model${entries.length === 1 ? '' : 's'}`
+      + ` ${parallel ? 'at the same time' : 'one after another'} · ${total} tokens in ${wall.toFixed(1)}s`
+      + (wall > 0 ? ` · ${(total / wall).toFixed(1)} tok/s combined` : '');
+    _compareRunning = false;
+    _compareControllers = [];
+    if (run) { run.style.display = ''; run.disabled = false; }
+    if (stop) stop.style.display = 'none';
+  }
+}
+
+function stopCompare() {
+  if (!_compareRunning) return;
+  _compareRunning = false;
+  // Aborting the fetch makes the proxy post /stop for that model.
+  _compareControllers.forEach(c => { try { c.abort(); } catch (e) { /* already done */ } });
 }
 
 function openBenchmark() {

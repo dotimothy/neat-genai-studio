@@ -1258,7 +1258,7 @@ body.solutions-open { overflow: hidden; }
 
   /* Declutter the header: benchmark moves to the drawer; full screen is
      redundant on phones (browser chrome auto-hides; unsupported on iOS). */
-  #benchmarkButton, #fullscreenButton { display: none; }
+  #benchmarkButton, #compareButton, #fullscreenButton { display: none; }
   .header-actions { gap: 8px; }
 
   /* Composer: tuck Snap + Upload behind the "+" so the text field keeps room. */
@@ -1534,3 +1534,77 @@ body.resizing video { pointer-events: none; }
 .drop-overlay.is-blocked .drop-overlay-icon { color: var(--err); }
 .drop-overlay-title { font-size: 17px; font-weight: 700; color: var(--text); }
 .drop-overlay-sub { font-size: 13px; color: var(--text-3); max-width: 360px; }
+
+/* ---- Several models loaded: limit control, active-model menu, compare ---- */
+.model-name-pill.header-pill { font-family: inherit; cursor: pointer; transition: color .2s ease, border-color .2s ease; }
+.model-name-pill.header-pill:hover { color: var(--text); border-color: var(--border-strong); }
+.header-pill-caret { display: none; flex: none; font-size: 10px; color: var(--text-3); }
+.model-name-pill.header-pill.has-menu .header-pill-caret { display: inline; }
+.header-pill-count {
+  flex: none; font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 999px;
+  background: var(--accent-weak); color: var(--accent-strong); font-variant-numeric: tabular-nums;
+}
+.header-pill-count[hidden] { display: none; }
+
+.model-resident-row {
+  flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px 10px;
+  margin-top: 16px; padding-top: 13px; border-top: 1px solid var(--border);
+}
+.model-resident-label { font-size: 12.5px; font-weight: 600; color: var(--text-2); }
+.model-resident-row .setting-select { width: auto; min-width: 112px; flex: none; }
+.model-resident-row .hub-note { flex: 1 1 240px; padding: 0; }
+.model-action.model-use { min-width: 58px; }
+
+.active-model-menu {
+  position: fixed; z-index: 2500; padding: 6px; border-radius: var(--radius);
+  background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-lg);
+  display: flex; flex-direction: column; gap: 2px; max-height: min(70dvh, 420px); overflow-y: auto;
+}
+.active-model-menu[hidden] { display: none; }
+.active-model-menu-head {
+  padding: 6px 10px 4px; font-size: 10px; font-weight: 700; letter-spacing: .09em;
+  text-transform: uppercase; color: var(--text-3);
+}
+.active-model-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 10px;
+  font: inherit; font-size: 13px; text-align: left; color: var(--text-2); cursor: pointer;
+  background: transparent; border: 1px solid transparent; border-radius: var(--radius-sm);
+}
+.active-model-item:hover, .active-model-item:focus-visible { background: var(--surface-2); color: var(--text); outline: none; }
+.active-model-item.is-active { color: var(--text); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); background: color-mix(in srgb, var(--accent) 9%, var(--surface-2)); }
+.active-model-check { flex: none; width: 14px; color: var(--accent-strong); font-weight: 700; }
+.active-model-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono, ui-monospace, monospace); font-size: 12px; }
+.active-model-menu-foot { display: flex; justify-content: space-between; gap: 8px; margin-top: 4px; padding: 6px 4px 2px; border-top: 1px solid var(--border); }
+.active-model-link { font: inherit; font-size: 12px; color: var(--accent-strong); background: none; border: 0; padding: 4px 6px; cursor: pointer; border-radius: 6px; }
+.active-model-link:hover { background: var(--surface-2); }
+
+.compare-body { max-width: 1400px; display: flex; flex-direction: column; gap: 14px; }
+.compare-prompt-field textarea {
+  font: inherit; font-size: 14px; padding: 9px 11px; border-radius: var(--radius-sm); resize: vertical;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text); min-height: 42px;
+}
+.compare-prompt-field textarea:focus { outline: none; border-color: color-mix(in srgb, var(--accent) 60%, var(--border)); box-shadow: 0 0 0 3px var(--accent-weak); }
+.compare-parallel { display: inline-flex; align-items: center; gap: 7px; padding: 10px 2px; font-size: 13px; color: var(--text-2); cursor: pointer; white-space: nowrap; }
+.compare-summary { min-height: 18px; font-size: 12.5px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.compare-empty { padding: 14px 16px; border: 1px dashed var(--border); border-radius: var(--radius); }
+.compare-grid { display: grid; grid-template-columns: repeat(var(--compare-cols, 2), minmax(0, 1fr)); gap: 14px; align-items: start; }
+.compare-col {
+  display: flex; flex-direction: column; gap: 10px; min-width: 0; padding: 14px 16px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-sm);
+}
+.compare-col.is-running { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
+.compare-col-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.compare-col-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; font-size: 13.5px; }
+.compare-col-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.compare-col-stats span { display: flex; flex-direction: column; gap: 1px; font-size: 10px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--text-3); }
+.compare-col-stats b { font-size: 17px; font-weight: 700; letter-spacing: 0; text-transform: none; color: var(--accent-strong); font-variant-numeric: tabular-nums; }
+.compare-col-body { min-height: 120px; max-height: 52dvh; overflow-y: auto; font-size: 13.5px; line-height: 1.55; word-break: break-word; }
+.compare-col-body:empty::after { content: 'The answer appears here.'; color: var(--text-3); }
+.compare-col-state { font-size: 11.5px; color: var(--text-3); }
+.compare-col-state.is-busy { color: var(--accent-strong); }
+.compare-col-state.is-ok { color: var(--ok); }
+.compare-col-state.is-error { color: var(--err); }
+@media (max-width: 760px) {
+  .compare-grid { grid-template-columns: minmax(0, 1fr); }
+  .compare-col-body { max-height: none; }
+}
