@@ -170,5 +170,64 @@ class NoThinkRewriteTests(unittest.TestCase):
         self.assertEqual(out[0]["content"][-1], {"type": "text", "text": "/no_think"})
 
 
+class LiveStatusLineTests(unittest.TestCase):
+    """The animated status lines. Under the test runner stdout is not a
+    terminal, so colour is off and the drawing can be compared as plain text."""
+
+    def test_bar_fills_in_proportion_and_keeps_its_width(self):
+        self.assertEqual(cli.progress_bar(0, width=8), "░" * 8)
+        self.assertEqual(cli.progress_bar(50, width=8), "████░░░░")
+        self.assertEqual(cli.progress_bar(100, width=8), "████████")
+        for pct in (0, 3, 37.5, 99, 100, 250, -5):
+            self.assertEqual(len(cli.progress_bar(pct, frame=7, width=24)), 24)
+
+    def test_bar_edge_moves_in_eighths_of_a_cell(self):
+        # 8 cells: 6.25% is half of the first cell.
+        self.assertEqual(cli.progress_bar(6.25, width=8), "▌" + "░" * 7)
+        self.assertEqual(cli.progress_bar(56.25, width=8), "████▌░░░")
+
+    def test_bar_without_a_percentage_sweeps(self):
+        frames = {cli.progress_bar(None, frame=f, width=20) for f in range(40)}
+        self.assertGreater(len(frames), 5)
+        self.assertTrue(all(len(f) == 20 and "█" in f for f in frames))
+
+    def test_spinner_cycles_through_its_frames(self):
+        seen = [cli.spinner_frame(i) for i in range(len(cli._SPIN_FRAMES))]
+        self.assertEqual("".join(seen), cli._SPIN_FRAMES)
+        self.assertEqual(cli.spinner_frame(len(cli._SPIN_FRAMES)), seen[0])
+
+    def test_a_line_is_cut_to_the_terminal_width_keeping_colour_codes(self):
+        coloured = "\x1b[38;2;1;2;3mabcdef\x1b[0mghij"
+        self.assertEqual(cli._fit(coloured, 20), coloured)             # fits: untouched
+        cut = cli._fit(coloured, 6)
+        self.assertEqual(cli._visible_len(cut), 6)
+        self.assertTrue(cli._ANSI_RE.sub("", cut).startswith("abcde"))
+        self.assertIn("\x1b[38;2;1;2;3m", cut)
+        self.assertEqual(cli._visible_len("\x1b[2mhi\x1b[0m"), 2)
+
+    def test_load_line_shows_the_bar_scale_and_countdown(self):
+        line = cli._load_progress_line(
+            {"pct": 50, "stagesTotal": 182, "elapsedS": 3, "remainingS": 3})
+        self.assertIn("50%", line)
+        self.assertIn("182 stages", line)
+        self.assertIn("~3s left", line)
+        self.assertIn("█", line)
+        done = cli._load_progress_line({"pct": 99, "elapsedS": 9, "remainingS": 0})
+        self.assertIn("finishing…", done)
+        counted = cli._load_progress_line({"pct": 10, "filesDone": 4, "filesTotal": 40})
+        self.assertIn("stage 4/40", counted)
+
+    def test_nothing_is_animated_when_output_is_not_a_terminal(self):
+        calls = []
+        live = cli.LiveLine(lambda frame, elapsed: calls.append(frame) or "x")
+        self.assertFalse(live.active)
+        with live:
+            pass
+        live.stop()                                    # stopping twice is harmless
+        self.assertEqual(calls, [])
+        with cli.spinner("waiting…") as spin:
+            self.assertFalse(spin.active)
+
+
 if __name__ == "__main__":
     unittest.main()

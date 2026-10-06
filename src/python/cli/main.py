@@ -10,6 +10,7 @@ library (+ PyYAML to read the config).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.client
 import json
 import socket
@@ -72,6 +73,181 @@ if _use_color():
         CODE = "\033[38;5;117m"
 else:
     RESET = BOLD = DIM = ACCENT = TEAL = MUTED = OK = ERR = CODE = ITAL = ULINE = ""
+
+
+# ---- live status line: spinner, progress bar, timers --------------------------
+# Anything the CLI waits on (a model load, a download, a server coming up, the
+# first token) is drawn as one line that keeps moving, so a long wait never looks
+# like a hang. Animation needs a real terminal: when stdout is redirected the
+# callers print plain lines instead, and logs never collect escape codes.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_BAR_EIGHTHS = " ▏▎▍▌▋▊▉█"
+# The Neat sparkle palette, as in the run.sh banner.
+_PALETTE = ((61, 179, 138), (74, 168, 54), (154, 190, 30), (58, 125, 216), (223, 108, 30))
+_BAR_STOPS = (_PALETTE[0], _PALETTE[2])        # bars run teal -> lime
+_cursor_hidden = False
+
+
+def _animate():
+    """Whether to draw moving status lines at all."""
+    return sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+
+
+def _fg(rgb):
+    """Foreground escape for an RGB colour (256-colour where truecolor is unsafe)."""
+    if not _use_color():
+        return ""
+    r, g, b = (max(0, min(255, int(v))) for v in rgb)
+    if _truecolor():
+        return f"\033[38;2;{r};{g};{b}m"
+    return f"\033[38;5;{16 + 36 * round(r / 51) + 6 * round(g / 51) + round(b / 51)}m"
+
+
+def _mix(a, b, t):
+    return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+
+
+def _gradient(stops, t):
+    """Colour at position t (0..1) along a list of RGB stops."""
+    t = max(0.0, min(1.0, t)) * (len(stops) - 1)
+    i = min(int(t), len(stops) - 2)
+    return _mix(stops[i], stops[i + 1], t - i)
+
+
+def _visible_len(text):
+    return len(_ANSI_RE.sub("", text))
+
+
+def _fit(line, width):
+    """Cut a line to `width` visible columns, keeping its colour codes intact.
+    A status line that wraps cannot be redrawn in place."""
+    if width <= 0 or _visible_len(line) <= width:
+        return line
+    out, shown, pos = [], 0, 0
+    for match in _ANSI_RE.finditer(line):
+        chunk = line[pos:match.start()]
+        take = chunk[:max(0, width - 1 - shown)]
+        out.append(take)
+        shown += len(take)
+        out.append(match.group())            # escapes take no columns: keep them all
+        pos = match.end()
+    out.append(line[pos:][:max(0, width - 1 - shown)])
+    return "".join(out) + "…" + RESET
+
+
+def spinner_frame(frame):
+    """One frame of the spinner; its colour drifts through the palette."""
+    glyph = _SPIN_FRAMES[frame % len(_SPIN_FRAMES)]
+    return f"{_fg(_gradient(_PALETTE + _PALETTE[:1], (frame % 60) / 60))}{glyph}{RESET}"
+
+
+def progress_bar(pct, frame=0, width=24):
+    """A bar for `pct` (0..100), or a sweeping one when `pct` is None.
+
+    Filled cells follow the teal-to-lime gradient with a highlight that travels
+    along them, and the leading edge moves in eighths of a cell so slow progress
+    is still visible. Without colour it degrades to plain block characters.
+    """
+    cells = []
+    if pct is None:                                  # unknown length: sweep a block
+        span, period = max(3, width // 5), 2 * (width - max(3, width // 5))
+        at = frame % max(1, period)
+        at = at if at <= period // 2 else period - at
+        for i in range(width):
+            inside = at <= i < at + span
+            cells.append(f"{_fg(_gradient(_BAR_STOPS, i / max(1, width - 1)))}█" if inside
+                         else f"{MUTED}░")
+        return "".join(cells) + RESET
+    fill = max(0.0, min(100.0, float(pct))) / 100.0 * width
+    full = int(fill)
+    eighth = int((fill - full) * 8)
+    glint = (frame * 0.7) % (width + 8) - 4          # highlight position, in cells
+    for i in range(width):
+        if i < full or (i == full and eighth):
+            colour = _gradient(_BAR_STOPS, i / max(1, width - 1))
+            near = max(0.0, 1.0 - abs(i - glint) / 2.5)
+            colour = _mix(colour, (255, 255, 255), 0.45 * near)
+            cells.append(f"{_fg(colour)}{'█' if i < full else _BAR_EIGHTHS[eighth]}")
+        else:
+            cells.append(f"{MUTED}░")
+    return "".join(cells) + RESET
+
+
+def _show_cursor():
+    global _cursor_hidden
+    if _cursor_hidden:
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+        _cursor_hidden = False
+
+
+class LiveLine:
+    """One status line, redrawn about twelve times a second on its own thread.
+
+    ``render(frame, elapsed_seconds)`` returns the line to show. Use it as a
+    context manager around the wait; nothing else may print while it is active.
+    Inactive, and silent, when stdout is not a terminal.
+    """
+
+    def __init__(self, render, interval=0.08):
+        self._render = render
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+        self.active = _animate()
+
+    def __enter__(self):
+        global _cursor_hidden
+        if not self.active:
+            return self
+        if not _cursor_hidden:
+            import atexit
+            atexit.register(_show_cursor)            # never leave the cursor hidden
+            sys.stdout.write("\033[?25l")
+            _cursor_hidden = True
+        self._started = time.monotonic()
+        self._thread = threading.Thread(target=self._run, name="live-line", daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        frame = 0
+        while not self._stop.is_set():
+            try:
+                line = self._render(frame, time.monotonic() - self._started)
+            except Exception:  # noqa: BLE001 - a drawing bug must not break the wait
+                line = ""
+            if line:
+                width = shutil.get_terminal_size((80, 24)).columns
+                sys.stdout.write("\r\x1b[K" + _fit(line, width - 1))
+                sys.stdout.flush()
+            frame += 1
+            self._stop.wait(self._interval)
+
+    def stop(self):
+        """End the animation and leave the line empty, cursor at its start."""
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join()
+        self._thread = None
+        sys.stdout.write("\r\x1b[K")
+        _show_cursor()
+        sys.stdout.flush()
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
+
+
+def spinner(label):
+    """A spinner with a label and a running timer: ``⠹ connecting…  12s``.
+    ``label`` may be a callable returning the current text."""
+    def _render(frame, elapsed):
+        text = label() if callable(label) else label
+        return f"  {spinner_frame(frame)} {MUTED}{text}{RESET}  {DIM}{fmt_secs(elapsed)}{RESET}"
+    return LiveLine(_render)
 
 
 # Optional readline: gives the chat prompt up/down history recall + line editing.
@@ -594,6 +770,15 @@ def stream_chat(oai, model, messages, max_tokens, render=False, think=True):
     reasoning_tokens, think_open, held_deltas = 0, False, 0
     splitter = _ThinkSplitter()
     buf, md_state = "", [False, False]   # render: [in code fence, in $$ math block]
+    # Until the first token arrives (a second or more with an image attached),
+    # show that the request is in flight rather than a bare cursor.
+    waiting = spinner("generating…") if render else None
+
+    def _stop_waiting():
+        nonlocal waiting
+        if waiting is not None:
+            waiting.stop()
+            waiting = None
 
     def _show_think(text):
         nonlocal think_open
@@ -625,7 +810,10 @@ def stream_chat(oai, model, messages, max_tokens, render=False, think=True):
         sys.stdout.write(f"\r\x1b[K{shown}{DIM}{count}{RESET}")
         sys.stdout.flush()
 
-    with urllib.request.urlopen(req, timeout=600) as resp:
+    # The spinner's own exit stops it too, so an error or Ctrl+C before the
+    # first token still clears the line and restores the cursor.
+    with waiting if waiting is not None else contextlib.nullcontext(), \
+            urllib.request.urlopen(req, timeout=600) as resp:
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data:"):
@@ -654,6 +842,7 @@ def stream_chat(oai, model, messages, max_tokens, render=False, think=True):
             clean = _CTRL_TOKENS.sub("", delta)
             if not clean:
                 continue
+            _stop_waiting()                         # first output: the line is the reply's now
             # Tokens are counted per incoming delta, not per emitted piece: the
             # splitter buffers the undecided prefix and would otherwise report a
             # whole held run as one token. A delta that arrives while the prefix
@@ -699,6 +888,7 @@ def stream_chat(oai, model, messages, max_tokens, render=False, think=True):
                 else:
                     sys.stdout.write(piece)
                     sys.stdout.flush()
+    _stop_waiting()                                 # a reply with no visible text
     for kind, piece in splitter.flush():
         if kind == "think":
             reasoning_tokens += held_deltas
@@ -950,7 +1140,7 @@ def fmt_secs(s):
     return f"{s}s" if s < 60 else f"{s // 60}m {s % 60:02d}s"
 
 
-def _load_progress_line(ld):
+def _load_progress_line(ld, frame=0):
     """One redraw of the load bar from a /control/status `loading` block.
 
     Mirrors the download bar's look so the two read as the same thing. The
@@ -961,8 +1151,9 @@ def _load_progress_line(ld):
     bits = []
     pct = ld.get("pct")
     if isinstance(pct, (int, float)):
-        filled = max(0, min(20, int(pct / 5)))
-        bits.append(f"[{'█' * filled}{'░' * (20 - filled)}] {int(pct)}%")
+        bits.append(f"{progress_bar(pct, frame)} {MUTED}{int(pct)}%")
+    else:
+        bits.append(f"{progress_bar(None, frame)}{MUTED}")
     done, total = ld.get("filesDone"), ld.get("filesTotal")
     if total and done is not None:
         bits.append(f"stage {done}/{total}")
@@ -972,15 +1163,15 @@ def _load_progress_line(ld):
         bits.append(fmt_secs(ld["elapsedS"]))
     remain = ld.get("remainingS")
     if remain is not None:
-        bits.append(f"~{fmt_secs(remain)} left" if remain > 0 else "finishing…")
-    return "  ".join(b for b in bits if b)
+        bits.append(f"~{fmt_secs(remain)} left" if remain >= 0.5 else "finishing…")
+    return "  ".join(b for b in bits if b) + RESET
 
 
 def _post_load_with_progress(ctrl, name, do_post):
     """Run `do_post` on a worker thread and draw live load progress until it
     returns. Falls back to the plain blocking call when stdout is not a TTY (a
     redirected log should not collect carriage returns and escape codes)."""
-    if not sys.stdout.isatty():
+    if not _animate():
         return do_post()
 
     box = {}
@@ -999,33 +1190,38 @@ def _post_load_with_progress(ctrl, name, do_post):
     est = hint.get("estimatedLoadS")
     est = float(est) if isinstance(est, (int, float)) and est > 0 else None
     stages = hint.get("stagesTotal")
-    started = time.monotonic()
-    worker = threading.Thread(target=_work, name="model-load", daemon=True)
-    worker.start()
-    drew = False
-    while worker.is_alive():
-        worker.join(0.5)
-        if not worker.is_alive():
-            break
-        try:
-            ld = (_http(f"http://{ctrl[0]}:{ctrl[1]}/control/status", timeout=2) or {}).get("loading")
-        except Exception:
-            ld = None
-        if not (ld and ld.get("name") == name):
-            elapsed = time.monotonic() - started
+    reported = {"ld": None, "at": 0.0}      # the server's own progress, when it answers
+    shown = {"pct": 0.0}
+
+    def _render(frame, elapsed):
+        ld = reported["ld"]
+        if ld and time.monotonic() - reported["at"] < 1.5:
+            ld = dict(ld, elapsedS=elapsed)
+        else:
+            # Recomputed every frame, so the bar glides instead of stepping.
             ld = {"name": name, "elapsedS": elapsed, "stagesTotal": stages}
             if est:
                 ld["pct"] = min(99.0, elapsed / est * 100.0)   # hold at 99: done when the call returns
                 ld["remainingS"] = max(0.0, est - elapsed)
-        if ld and ld.get("name") == name:
-            line = _load_progress_line(ld)
-            if line:
-                sys.stdout.write(f"\r\x1b[K{MUTED}  {line}{RESET}")
-                sys.stdout.flush()
-                drew = True
-    if drew:
-        sys.stdout.write("\r\x1b[K")   # clear the bar before the result line
-        sys.stdout.flush()
+        if isinstance(ld.get("pct"), (int, float)):
+            # Ease towards the target and never run backwards between sources.
+            shown["pct"] = max(shown["pct"], shown["pct"] + (ld["pct"] - shown["pct"]) * 0.3)
+            ld["pct"] = shown["pct"]
+        return f"  {spinner_frame(frame)} {_load_progress_line(ld, frame)}"
+
+    worker = threading.Thread(target=_work, name="model-load", daemon=True)
+    with LiveLine(_render):
+        worker.start()
+        while worker.is_alive():
+            worker.join(0.5)
+            if not worker.is_alive():
+                break
+            try:
+                ld = (_http(f"http://{ctrl[0]}:{ctrl[1]}/control/status", timeout=2) or {}).get("loading")
+            except Exception:
+                ld = None
+            if ld and ld.get("name") == name:
+                reported["ld"], reported["at"] = ld, time.monotonic()
     if "error" in box:
         raise box["error"]
     return box.get("result")
@@ -1104,35 +1300,56 @@ def _download_one(catalog_dir, hub, repo_id):
     from server.hub import hub_download_stream, safe_name
     name = safe_name(repo_id)
     print(f"{MUTED}  downloading {repo_id}…{RESET}")
+    # Latest event, plus a smoothed transfer rate worked out from successive ones.
+    state = {"phase": "resolving", "pct": None, "done": 0, "total": 0,
+             "rate": None, "mark": None}
+
+    def _render(frame, elapsed):
+        if state["phase"] != "downloading":
+            return f"  {spinner_frame(frame)} {MUTED}resolving files…{RESET}  {DIM}{fmt_secs(elapsed)}{RESET}"
+        pct, done, total, rate = state["pct"], state["done"], state["total"], state["rate"]
+        bits = [progress_bar(pct, frame) + MUTED + (f" {pct}%" if pct is not None else "")]
+        bits.append(f"{fmt_bytes(done)} / {fmt_bytes(total)}" if total else fmt_bytes(done))
+        if rate:
+            bits.append(f"{fmt_bytes(rate)}/s")
+            if total and total > done and (total - done) / rate >= 0.5:
+                bits.append(f"~{fmt_secs((total - done) / rate)} left")
+        return f"  {spinner_frame(frame)} " + "  ".join(b for b in bits if b) + RESET
+
+    def _note_progress(evt):
+        done, now = evt.get("downloaded") or 0, time.monotonic()
+        mark = state["mark"]
+        if mark and now - mark[0] >= 0.5 and done >= mark[1]:
+            rate = (done - mark[1]) / (now - mark[0])
+            state["rate"] = rate if state["rate"] is None else 0.6 * state["rate"] + 0.4 * rate
+            state["mark"] = (now, done)
+        elif mark is None:
+            state["mark"] = (now, done)
+        state.update(phase="downloading", pct=evt.get("pct"), done=done,
+                     total=evt.get("total") or 0)
+
+    live = LiveLine(_render)
     try:
-        for line in hub_download_stream(catalog_dir, hub, repo_id):
-            try:
-                evt = json.loads(line)
-            except Exception:
-                continue
-            state = evt.get("state")
-            if state == "downloading":
-                pct = evt.get("pct")
-                sz = (f"{fmt_bytes(evt.get('downloaded'))} / {fmt_bytes(evt.get('total'))}"
-                      if evt.get("total") else fmt_bytes(evt.get("downloaded")))
-                bar = ""
-                if pct is not None:
-                    filled = int(pct / 5)
-                    bar = f"[{'█' * filled}{'░' * (20 - filled)}] {pct}%"
-                sys.stdout.write(f"\r\x1b[K{MUTED}  {bar} {sz}{RESET}")
-                sys.stdout.flush()
-            elif state == "resolving":
-                sys.stdout.write(f"\r\x1b[K{MUTED}  resolving…{RESET}")
-                sys.stdout.flush()
-            elif state == "done":
-                name = evt.get("name") or name
-                sys.stdout.write(f"\r\x1b[K{OK}✔ downloaded {name}{RESET}\n")
-            elif state == "error":
-                sys.stdout.write(f"\r\x1b[K{ERR}  download failed ({repo_id}): "
-                                 f"{evt.get('message')}{RESET}\n")
-                return None
+        with live:
+            for line in hub_download_stream(catalog_dir, hub, repo_id):
+                try:
+                    evt = json.loads(line)
+                except Exception:
+                    continue
+                kind = evt.get("state")
+                if kind == "downloading":
+                    _note_progress(evt)
+                elif kind == "resolving":
+                    state["phase"] = "resolving"
+                elif kind == "done":
+                    name = evt.get("name") or name
+                    live.stop()
+                    print(f"{OK}✔ downloaded {name}{RESET}")
+                elif kind == "error":
+                    live.stop()
+                    print(f"{ERR}  download failed ({repo_id}): {evt.get('message')}{RESET}")
+                    return None
     except Exception as exc:  # noqa: BLE001
-        sys.stdout.write("\n")
         print(f"{ERR}  download error ({repo_id}): {exc}{RESET}")
         return None
     return name
@@ -1284,36 +1501,43 @@ def run_one_benchmark(ctrl, oai, model, runs, max_tokens, prompt):
     except Exception as exc:  # noqa: BLE001
         print(f"{ERR}  could not start benchmark: {exc}{RESET}")
         return None
-    while True:
-        try:
-            time.sleep(0.4)
-            d = ctrl_get(ctrl, "/control/benchmark/status")
-        except KeyboardInterrupt:
-            try:
-                ctrl_post(ctrl, "/control/benchmark/stop", {}, timeout=5)
-            except Exception:
-                pass
-            sys.stdout.write("\r\x1b[K")
-            print(f"{MUTED}  (benchmark stopped){RESET}")
-            return None
-        except Exception:
-            continue
+    latest = {"d": {}}
+
+    def _render(frame, elapsed):
+        d = latest["d"]
         total, done, cur = d.get("total", 0), d.get("done", 0), d.get("current")
-        if cur:
-            bits = f"{cur.get('tokens', 0)} tok"
-            if cur.get("ttftMs") is not None:
-                bits += f" · TTFT {cur['ttftMs']}ms"
-            if cur.get("tps") is not None:
-                bits += f" · {cur['tps']} tok/s"
-            sys.stdout.write(f"\r{DIM}  run {cur.get('index', 0) + 1}/{total} · {bits}{RESET}\x1b[K")
-            sys.stdout.flush()
-        elif total:
-            sys.stdout.write(f"\r{DIM}  {done}/{total} runs done{RESET}\x1b[K")
-            sys.stdout.flush()
-        if not d.get("running"):
-            sys.stdout.write("\r\x1b[K")
-            sys.stdout.flush()
-            return d.get("summary")
+        if not total:
+            return f"  {spinner_frame(frame)} {MUTED}starting the benchmark…{RESET}"
+        # Whole runs plus the share of the run in flight, so the bar keeps moving.
+        part = min(1.0, (cur.get("tokens", 0) / max_tokens)) if cur and max_tokens else 0.0
+        head = f"  {spinner_frame(frame)} {progress_bar((done + part) / total * 100, frame, 16)}{MUTED}"
+        if not cur:
+            return f"{head}  {done}/{total} runs done{RESET}"
+        bits = f"{cur.get('tokens', 0)} tok"
+        if cur.get("ttftMs") is not None:
+            bits += f" · TTFT {cur['ttftMs']}ms"
+        if cur.get("tps") is not None:
+            bits += f" · {cur['tps']} tok/s"
+        return f"{head}  run {cur.get('index', 0) + 1}/{total} · {bits}{RESET}"
+
+    with LiveLine(_render):
+        while True:
+            try:
+                time.sleep(0.4)
+                d = ctrl_get(ctrl, "/control/benchmark/status")
+            except KeyboardInterrupt:
+                try:
+                    ctrl_post(ctrl, "/control/benchmark/stop", {}, timeout=5)
+                except Exception:
+                    pass
+                break
+            except Exception:
+                continue
+            latest["d"] = d
+            if not d.get("running"):
+                return d.get("summary")
+    print(f"{MUTED}  (benchmark stopped){RESET}")
+    return None
 
 
 def _bench_stat_row(label, m, unit=""):
@@ -1618,7 +1842,8 @@ def _start_rag_service(config_path):
     env = os.environ.copy()
     env["VDB_EMBED_MODEL_DIR"] = emb
     env["VECTOR_DB_PATH"] = db
-    print(f"{MUTED}  starting the RAG service (loads the embedding model — a moment)…{RESET}")
+    if not _animate():
+        print(f"{MUTED}  starting the RAG service (loads the embedding model — a moment)…{RESET}")
     try:
         proc = subprocess.Popen(
             [sys.executable, "-u", worker], env=env, start_new_session=True,
@@ -1633,9 +1858,10 @@ def _start_rag_service(config_path):
         atexit.register(_stop_rag_service)
         _RAG_ATEXIT = True
     try:
-        ready = _wait_rag_ready(proc=proc)
+        with spinner("starting the RAG service (loading the embedding model)…"):
+            ready = _wait_rag_ready(proc=proc)
     except KeyboardInterrupt:              # Ctrl+C while it loads — cancel cleanly
-        print(f"\n{MUTED}  (cancelled — stopping the RAG service){RESET}")
+        print(f"{MUTED}  (cancelled — stopping the RAG service){RESET}")
         _stop_rag_service()
         return False
     if not ready:
@@ -1959,10 +2185,16 @@ def main():
     think = not args.no_think    # reasoning models think unless told otherwise (/think)
 
     print(f"{ACCENT}{BOLD}▸{RESET} Neat GenAI Studio — terminal chat")
-    print(f"{MUTED}  connecting to the model server ({oai[0]}:{oai[1]})…{RESET}")
-    if not wait_ready(oai):
+    where = f"the model server ({oai[0]}:{oai[1]})"
+    if not _animate():
+        print(f"{MUTED}  connecting to {where}…{RESET}")
+    with spinner(f"connecting to {where}…"):
+        ready = wait_ready(oai)
+    if not ready:
         print(f"{ERR}✘ The model server never became ready.{RESET}")
         return 1
+    if _animate():
+        print(f"{MUTED}  connected to {where}.{RESET}")
 
     cat = catalog(ctrl)
     active = args.model.strip()
@@ -2196,9 +2428,15 @@ def main():
                 # The endpoint replies BEFORE exiting (~1.5s later), so polling
                 # immediately would find the outgoing server and report success
                 # while nothing has been reset. Wait for it to go away first.
-                if not wait_gone(oai, timeout=30):
+                phase = {"text": "resetting the accelerator: waiting for the model server to stop…"}
+                with spinner(lambda: phase["text"]):
+                    gone = wait_gone(oai, timeout=30)
+                    if gone:
+                        phase["text"] = "accelerator reset: waiting for the model server to come back…"
+                    back = gone and wait_ready(oai, timeout=180)
+                if not gone:
                     print(f"{ERR}  the model server did not stop — check run.sh.{RESET}")
-                elif wait_ready(oai, timeout=180):
+                elif back:
                     print(f"{OK}✔ model server is back. Load a model with /load.{RESET}")
                 else:
                     print(f"{ERR}  the model server did not come back — check run.sh.{RESET}")

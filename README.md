@@ -286,6 +286,15 @@ and the OpenAI endpoint to stream replies). Type a message to chat; commands:
 Replies render live as Markdown, and LaTeX math is converted to Unicode for the
 terminal (`$E = mc^2$` → `E = mc²`, `\frac`, `\sqrt`, Greek letters, `\sum`, …).
 
+Anything the CLI waits on is drawn as one moving status line, so a long wait
+never looks like a hang: a spinner with a running timer while it connects to
+the model server, starts the RAG service, waits out an accelerator reset or
+waits for the first token of a reply, and a progress bar for model loads
+(percentage, stage count, elapsed time and an estimated time left), downloads
+(size, transfer rate and time left) and benchmarks. The animation is drawn
+only on a real terminal; with output redirected to a file or a pipe the CLI
+prints plain lines instead.
+
 Ctrl+C stops the current reply; it prints per-response timing (tokens, TTFT,
 tok/s). Exiting shuts the model server down. Use **↑/↓** at the prompt to recall
 previous prompts (history persists across sessions in `~/.neat_ai_history`).
