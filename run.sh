@@ -75,12 +75,13 @@ SERVER_STATUS_FILE="${SERVER_STATUS_FILE:-${EXAMPLE_DIR}/.neat-genai-server.stat
 RESET_REQUEST_FILE="${RESET_REQUEST_FILE:-${EXAMPLE_DIR}/.neat-genai-reset.request}"
 export NEAT_RESET_REQUEST_FILE="${RESET_REQUEST_FILE}"
 # The reset is board-wide (it restarts the MLA dispatcher), and the web UI is
-# reachable from the network without login, so the web route requires a
-# token from any client that is not on the board itself. run.sh generates it
-# once (kept in a 0600 file) and prints it at startup; the browser asks for it
-# the first time Reset MLA is pressed. STUDIO_RESET_AUTH=0 disables the check
-# for a trusted network; STUDIO_RESET_TOKEN sets a fixed value.
-STUDIO_RESET_AUTH="${STUDIO_RESET_AUTH:-1}"
+# reachable from the network without login. By default Reset MLA needs no
+# token, so anyone who can open the UI can press it. STUDIO_RESET_AUTH=1 turns
+# a token on for any client that is not on the board itself: run.sh generates
+# it once (kept in a 0600 file) and prints it at startup, and the browser asks
+# for it the first time Reset MLA is pressed. STUDIO_RESET_TOKEN sets a fixed
+# value (and only applies with STUDIO_RESET_AUTH=1).
+STUDIO_RESET_AUTH="${STUDIO_RESET_AUTH:-0}"
 export STUDIO_RESET_AUTH
 RESET_TOKEN_FILE="${RESET_TOKEN_FILE:-${EXAMPLE_DIR}/.neat-genai-reset.token}"
 ensure_reset_token() {
@@ -359,7 +360,13 @@ Usage:
 
 Environment:
   AUTO_SETUP=0        Do not auto-run ./setup.sh on first launch (error instead).
-  NEAT_APPS_BRANCH    Branch to pull for `update` (default: main).
+  STUDIO_RESET_AUTH=1 Require a token for Reset MLA from other machines (default:
+                      off). The token is printed at startup.
+  NEAT_STUDIO_BRANCH  Branch to pull for `update` (default: main).
+  NEAT_STUDIO_REPO_URL
+                      Repository `update` fetches from when this is not a git
+                      checkout (default: github.com/dotimothy/neat-genai-studio).
+  GITHUB_TOKEN        Sent with that download, for a private repository.
   UPDATE_DEPS=1       Run full setup.sh dependency refresh during `update`.
   BACKEND_CORS_ORIGINS
                       With --backend-only: origins (comma-separated, or *) whose
@@ -566,12 +573,12 @@ do_clean() {
   ok "Clean complete. Re-run ./setup.sh to reinstall."
 }
 
-# Update the example's source to the latest published version. User data — venvs,
+# Update the Studio's source to the latest published version. User data — venvs,
 # config.local.yaml, RAG db, and downloaded models (which live outside this dir) —
-# is preserved. In a git checkout this is `git pull`; standalone (fetched via
-# get-example.sh) it re-fetches the release archive and mirrors the source. Set
-# NEAT_APPS_BRANCH chooses a branch (default main); UPDATE_DEPS=1 refreshes only
-# the Python dependencies.
+# is preserved. In a git checkout this is `git pull`; standalone (installed with
+# install.sh) it re-fetches the repository archive and mirrors the source.
+# NEAT_STUDIO_BRANCH chooses a branch (default main); UPDATE_DEPS=1 also
+# refreshes the Python dependencies.
 migrate_piper_voices() {
   local assets="${PYTHON_DIR}/ui/assets" py voice encoder decoder needs_split=0
   py="${PIPERTTS_PYTHON:-${EXAMPLE_DIR}/.venv-pipertts/bin/python}"
@@ -600,7 +607,9 @@ migrate_piper_voices() {
 }
 
 do_update() {
-  local branch="${NEAT_APPS_BRANCH:-main}"
+  # NEAT_APPS_* are the names this used when the Studio lived in sima-neat/apps;
+  # they are still honoured so existing scripts keep working.
+  local branch="${NEAT_STUDIO_BRANCH:-${NEAT_APPS_BRANCH:-main}}"
   local supertonic_before
   supertonic_before="$(supertonic_fingerprint)"
   if do_status >/dev/null 2>&1; then
@@ -610,7 +619,7 @@ do_update() {
 
   if command -v git >/dev/null 2>&1 \
        && git -C "${EXAMPLE_DIR}" ls-files --error-unmatch run.sh >/dev/null 2>&1; then
-    # Part of an apps git checkout — pull is the cleanest update.
+    # A git checkout — pull is the cleanest update.
     step "Pulling the latest changes (git)…"
     if git -C "${EXAMPLE_DIR}" pull --ff-only; then
       ok "Source updated."
@@ -619,32 +628,51 @@ do_update() {
       return 1
     fi
   else
-    # Standalone (fetched via get-example.sh): re-download and mirror the source.
+    # Standalone (installed with install.sh): re-download and mirror the source.
     command -v tar >/dev/null 2>&1 || { errln "tar is required to update."; return 1; }
     command -v rsync >/dev/null 2>&1 || { errln "rsync is required to update a standalone install."; return 1; }
     local repo repo_url archive_url tmp root ex_path
-    repo_url="${NEAT_APPS_REPO_URL:-https://github.com/sima-neat/apps.git}"
+    repo_url="${NEAT_STUDIO_REPO_URL:-${NEAT_APPS_REPO_URL:-https://github.com/dotimothy/neat-genai-studio.git}}"
     repo="${repo_url%.git}"; repo="${repo#https://github.com/}"; repo="${repo#git@github.com:}"
-    archive_url="${NEAT_APPS_ARCHIVE_URL:-https://github.com/${repo}/archive/refs/heads/${branch}.tar.gz}"
+    # A private repository needs a token; the API tarball endpoint accepts one,
+    # the plain archive URL does not.
+    local -a auth=()
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+      auth=( -H "Authorization: Bearer ${GITHUB_TOKEN}" )
+      archive_url="https://api.github.com/repos/${repo}/tarball/${branch}"
+    else
+      archive_url="https://github.com/${repo}/archive/refs/heads/${branch}.tar.gz"
+    fi
+    archive_url="${NEAT_STUDIO_ARCHIVE_URL:-${NEAT_APPS_ARCHIVE_URL:-${archive_url}}}"
     tmp="$(mktemp -d)" || { errln "mktemp failed."; return 1; }
     step "Fetching the latest source (${branch})…"
     if [[ -f "${archive_url}" ]]; then
       cp "${archive_url}" "${tmp}/src.tar.gz" \
         || { errln "Cannot read archive: ${archive_url}"; rm -rf "${tmp}"; return 1; }
     elif command -v curl >/dev/null 2>&1; then
-      curl -fsSL "${archive_url}" -o "${tmp}/src.tar.gz" \
+      curl -fsSL ${auth[@]+"${auth[@]}"} "${archive_url}" -o "${tmp}/src.tar.gz" \
         || { errln "Download failed: ${archive_url}"; rm -rf "${tmp}"; return 1; }
     elif command -v wget >/dev/null 2>&1; then
-      wget -qO "${tmp}/src.tar.gz" "${archive_url}" \
+      wget -qO "${tmp}/src.tar.gz" ${GITHUB_TOKEN:+--header="Authorization: Bearer ${GITHUB_TOKEN}"} "${archive_url}" \
         || { errln "Download failed: ${archive_url}"; rm -rf "${tmp}"; return 1; }
     else
       errln "curl or wget is required to update."; rm -rf "${tmp}"; return 1
     fi
-    root="$(tar -tzf "${tmp}/src.tar.gz" 2>/dev/null | head -1 | cut -d/ -f1)"
-    ex_path="${root}/examples/genai/neat-genai-studio"
-    if ! tar -tzf "${tmp}/src.tar.gz" 2>/dev/null | grep -qxF "${ex_path}/"; then
-      errln "neat-genai-studio not found in the archive (branch ${branch})."
-      rm -rf "${tmp}"; return 1
+    # List the archive once, to a file: under pipefail, `tar | grep -q` (or
+    # `| head -1`) fails when the reader stops early and tar is cut off.
+    tar -tzf "${tmp}/src.tar.gz" > "${tmp}/list" 2>/dev/null \
+      || { errln "The downloaded archive is not a readable .tar.gz."; rm -rf "${tmp}"; return 1; }
+    root="$(sed -n '1{s,/.*,,;p;}' "${tmp}/list")"
+    # The Studio is the repository root here; an archive of an apps-style
+    # repository carries it under examples/genai/ instead.
+    if grep -qxF "${root}/run.sh" "${tmp}/list"; then
+      ex_path="${root}"
+    else
+      ex_path="${root}/examples/genai/neat-genai-studio"
+      if ! grep -qxF "${ex_path}/" "${tmp}/list"; then
+        errln "Neat GenAI Studio not found in the archive (${repo}, branch ${branch})."
+        rm -rf "${tmp}"; return 1
+      fi
     fi
     tar -xzf "${tmp}/src.tar.gz" -C "${tmp}" "${ex_path}" \
       || { errln "Extract failed."; rm -rf "${tmp}"; return 1; }
@@ -687,6 +715,7 @@ do_update() {
     # Explicitly exclude every install-owned path from transfer and deletion.
     rsync -a --delete-delay --delay-updates \
       ${keep[@]+"${keep[@]}"} \
+      --exclude='/.git/' \
       --exclude='/.venv/' \
       --exclude='/.venv-pipertts/' \
       --exclude='/.venv-supertonic/' \

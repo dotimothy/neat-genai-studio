@@ -43,6 +43,7 @@ from asr_switching_suite import (  # noqa: E402
     MlaFailureClassificationTests,
 )
 from hub_security_suite import HubPathSecurityTests  # noqa: E402,F401
+from install_suite import InstallScriptTests  # noqa: E402,F401
 from multi_model_suite import (  # noqa: E402,F401
     MlaMemoryTests,
     ResidentLimitTests,

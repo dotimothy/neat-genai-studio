@@ -2038,11 +2038,12 @@ class AppContext:
 
         @self.app.route('/models/reset-mla', methods=['POST'])
         def models_reset_mla():
-            # Board-wide operation on a network-exposed, login-less UI: require
-            # the token run.sh printed from any client that is not on the board.
-            # The cross-origin guard above only covers browser-originated
-            # requests, so it is not an authorization boundary for this route.
-            if os.environ.get('STUDIO_RESET_AUTH', '1') == '1':
+            # Board-wide operation on a network-exposed, login-less UI. Off by
+            # default; with STUDIO_RESET_AUTH=1 any client that is not on the
+            # board must send the token run.sh printed. The cross-origin guard
+            # above only covers browser-originated requests, so it is not an
+            # authorization boundary for this route.
+            if os.environ.get('STUDIO_RESET_AUTH', '0') == '1':
                 expected = os.environ.get('STUDIO_RESET_TOKEN', '')
                 provided = request.headers.get('X-Reset-Token', '')
                 on_board = request.remote_addr in ('127.0.0.1', '::1')

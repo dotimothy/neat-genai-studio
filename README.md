@@ -64,14 +64,29 @@ The photo in the vision demo is NASA's Apollo 17 view of Earth (AS17-148-22727, 
 Set `PYNEAT_PYTHON=/path/to/python-with-pyneat` if your Neat Library environment is
 somewhere else.
 
-## Install Apps
-Fetch only Neat GenAI Studio and enter its directory. This avoids downloading
-the complete Apps bundle:
+## Install
+Fetch the Studio into `./neat-genai-studio` and enter its directory. The
+installer depends only on this repository:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sima-neat/apps/main/scripts/get-example.sh | bash -s -- neat-genai-studio
+curl -fsSL https://raw.githubusercontent.com/dotimothy/neat-genai-studio/main/install.sh | bash
 cd neat-genai-studio
 ```
+
+Options, as environment variables in front of `bash`:
+
+- `STUDIO_DIR=/path/to/dir` installs somewhere else (default
+  `./neat-genai-studio`).
+- `STUDIO_BRANCH=<branch or tag>` installs that version (default `main`).
+- `STUDIO_SETUP=1` also runs `./setup.sh` when the source is in place.
+- `STUDIO_ARCHIVE=/path/to/studio.tar.gz` installs from an archive of the
+  repository instead of downloading, for a board without internet access.
+- `STUDIO_REPO=<owner>/<name>` installs from a fork, and `GITHUB_TOKEN=<token>`
+  lets it read a private one (fetch the installer itself with the same token:
+  `curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" …`).
+
+Cloning works as well (`git clone https://github.com/dotimothy/neat-genai-studio.git`);
+`./run.sh update` then uses `git pull`.
 
 ## Prepare the Model
 Install the UI virtual environment, Whisper ASR model, GTE-small embedding
@@ -324,15 +339,17 @@ two Python environments and does not rewrite models, voices, configuration, or
 the RAG database:
 
 ```bash
-./run.sh update              # git pull in a checkout, else re-fetch the example
-NEAT_APPS_BRANCH=develop ./run.sh update   # update from a specific branch
-UPDATE_DEPS=1 ./run.sh update              # also refresh Python dependencies
+./run.sh update              # git pull in a checkout, else re-fetch the source
+NEAT_STUDIO_BRANCH=develop ./run.sh update   # update from a specific branch
+UPDATE_DEPS=1 ./run.sh update                # also refresh Python dependencies
 ```
 
-In a full `apps` git checkout this runs `git pull`; if you fetched just this
-example with `get-example.sh`, it re-downloads the release archive and mirrors
-tracked source, removing files deleted by later releases while preserving the
-venvs, local config/certificates, RAG database, logs, and downloaded voices.
+In a git clone this runs `git pull`. In an install made with `install.sh` it
+downloads this repository's archive again and mirrors the tracked source,
+removing files deleted by later versions while preserving the venvs, local
+config/certificates, RAG database, logs, and downloaded voices. Set
+`NEAT_STUDIO_REPO_URL` to update from a fork, and `GITHUB_TOKEN` if that fork is
+private.
 
 ### Clean up
 Remove everything the app generated (both venvs, `config.local.yaml`, the RAG
@@ -672,13 +689,14 @@ and relaunches. Both paths share the relaunch budget (`MLA_MAX_RESTART_RETRIES`
 consecutive relaunches that fail within `RELAUNCH_STABLE_SECONDS`) and both are
 refused when `MLA_RESET=0`.
 
-Because the reset is board-wide and the web UI has no login, the web route
-requires a **reset token** from any client that is not on the board itself:
-`run.sh` generates one (kept in `.neat-genai-reset.token`, mode 0600) and
-prints it at startup; the browser asks for it the first time you press **Reset
-MLA** and remembers it. Set `STUDIO_RESET_TOKEN` to choose the value, or
-`STUDIO_RESET_AUTH=0` to drop the requirement on a trusted network. The CLI's
-`/reset` talks to the local control API and is unaffected.
+By default **Reset MLA** needs no token. The reset is board-wide and the web UI
+has no login, so on a network you do not trust, start the Studio with
+`STUDIO_RESET_AUTH=1` to require a **reset token** from any client that is not
+on the board itself: `run.sh` then generates one (kept in
+`.neat-genai-reset.token`, mode 0600) and prints it at startup, and the browser
+asks for it the first time you press **Reset MLA** and remembers it. Set
+`STUDIO_RESET_TOKEN` as well to choose the value. The CLI's `/reset` talks to
+the local control API and is unaffected either way.
 
 Restarting the dispatcher needs privileges. `run.sh` prefers the board's own
 `fix_devkit_runtime.sh` when present and otherwise restarts
@@ -1153,10 +1171,8 @@ Then test the browser UI:
 - Test scope: `tests/test-scope.yaml`
 
 ## Development From Source
-See the Apps repository [contributor guide](https://github.com/sima-neat/apps/blob/main/CONTRIBUTING.md)
-for contribution requirements. The repository (not the installed bundle) also
-carries the host-runnable unit suites under `tests/python/` (`*_suite.py` plus
-the `tts_text_check.py` script), collected by `tests/python/test_unit.py`;
-`./tests/test.sh --unit` runs them and they need only pytest and PyYAML. The single-example download contains the Studio
-source and can be edited directly; cloning the complete Apps repository is not
-required to run or customize it.
+The repository carries the host-runnable unit suites under `tests/python/`
+(`*_suite.py` plus the `tts_text_check.py` script), collected by
+`tests/python/test_unit.py`; `python -m pytest tests/python/test_unit.py` runs
+them and they need only pytest and PyYAML. An install made with `install.sh`
+contains the same source and can be edited directly.
