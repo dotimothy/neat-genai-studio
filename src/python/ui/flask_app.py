@@ -1399,6 +1399,34 @@ class AppContext:
         self._catalog_names_cache = (time.monotonic(), names)
         return names
 
+    def loaded_models_now(self):
+        """Names loaded on the model server right now, or None when it cannot
+        be asked (no control API, or it is busy with a load).
+
+        Asked fresh before every chat turn: the model the browser thinks is
+        active may have been unloaded since by another session, the API, or an
+        accelerator reset.
+        """
+        try:
+            resp = requests.get(
+                f"{self.control_base_url.rstrip('/')}/control/residency", timeout=3)
+            loaded = resp.json().get("loaded")
+        except Exception:
+            return None
+        return set(loaded) if isinstance(loaded, list) else None
+
+    def verify_model_async(self, model_name):
+        """After a failed generation, have the model server check whether the
+        model is still really loaded. Runs in the background; the browser sees
+        the outcome through its residency poll."""
+        def _verify():
+            try:
+                requests.post(f"{self.control_base_url.rstrip('/')}/control/verify",
+                              json={"name": model_name}, timeout=120)
+            except Exception:
+                pass
+        threading.Thread(target=_verify, name="verify-model", daemon=True).start()
+
     def model_supports_vision(self, model_name):
         """False only when the model is known to be text-only.
 
@@ -1926,6 +1954,12 @@ class AppContext:
         def models_status():
             return _proxy_control('GET', '/control/status', 10)
 
+        @self.app.route('/models/residency', methods=['GET'])
+        def models_residency():
+            # What is loaded right now; polled by the page to notice models
+            # loaded or unloaded elsewhere.
+            return _proxy_control('GET', '/control/residency', 5)
+
         @self.app.route('/models/memory', methods=['GET'])
         def models_memory():
             # Polled by the MLA memory meter while it is on screen.
@@ -2346,6 +2380,22 @@ class AppContext:
                     request.form.get('compareModels'), self.resolve_chat_model)
             except ValueError:
                 return jsonify({'error': 'Invalid comparison model list'}), 400
+            # The browser's idea of what is loaded can be stale. Refuse a turn
+            # for a model that is gone with a message that says so, rather than
+            # letting the request fail somewhere inside the stream.
+            loaded_now = self.loaded_models_now() if self.control_base_url else None
+            if loaded_now is not None:
+                if selected_model not in loaded_now:
+                    return jsonify({
+                        'error': f"{selected_model} is no longer loaded. It was unloaded "
+                                 "outside this page (another session, the API, or an "
+                                 "accelerator reset). Load it again or pick another model.",
+                        'code': 'model-not-loaded',
+                        'model': selected_model,
+                    }), 409
+                compare_models = [m for m in compare_models if m in loaded_now]
+                if len(compare_models) < 2:
+                    compare_models = []           # not enough left to compare: a normal turn
             if compare_models:
                 enable_tts = False
 
@@ -3408,6 +3458,9 @@ def stream_chat_request(messages, model, config, generation_id, socketio_event='
                 generation_id,
                 'Response generation failed. Please try again.',
             )
+            # The usual cause on a shared board: the model is no longer on the
+            # accelerator. Have the server check, so the page can say so.
+            genai_app.verify_model_async(model)
         return None
 
 def post_stop_to_sima(model_name=None):

@@ -848,6 +848,7 @@ window.onload = function () {
   initVision();
   initBenchmark();
   initActiveModelMenu();
+  initResidencyWatch();
   initMlaPolling();
   initCompare();
   initShowcase();
@@ -1706,6 +1707,10 @@ async function startProcessingInternal(resultMessage, textchat = null, waitForTr
         body: formData
       });
       const data = await response.json();
+      if (response.status === 409 && data && data.code === 'model-not-loaded') {
+        handleModelNotLoaded(data);
+        return;
+      }
       if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
       updateAsrMetrics(data.asr);
       displayResult(data.question || resultMessage, 'static/sample_audio.wav', data.ttt);
@@ -4285,6 +4290,83 @@ function renderMlaMemory() {
     if (claimed == null) parts.push('The memory the runtime holds could not be read, so only the estimate is shown; other programs on the accelerator are not counted.');
     note.textContent = parts.join(' ');
   }
+}
+
+// ---- Watching what is loaded -------------------------------------------
+// Models are loaded and unloaded by more than this page: another browser, the
+// terminal chat, the API, or an accelerator reset by another program. Every
+// few seconds the page asks what is loaded now; when that differs from what it
+// shows, it refreshes, and when the model you are chatting with has gone, it
+// says so instead of leaving a composer that fails on send.
+const RESIDENCY_POLL_MS = 3000;
+let _residencyTimer = null;
+let _residencyBusy = false;
+let _lostSeqSeen = null;     // newest "lost" report already shown (null: not baselined yet)
+
+function loadedSignature(names, asr) {
+  return names.slice().sort().join('\n') + '|' + (asr || '');
+}
+
+function noteModelGone(name, why) {
+  const text = `${name} is no longer loaded: ${why}.`;
+  setModelStatus(text, 'error');
+  if (typeof addChatMessage === 'function') addChatMessage(`⚠️ ${text}`, false, false);
+}
+
+async function pollResidency() {
+  if (_residencyBusy || document.hidden || !controlEnabled() || serverBusy()) return;
+  _residencyBusy = true;
+  try {
+    const resp = await fetch('/models/residency', { cache: 'no-store' });
+    if (!resp.ok) return;
+    const d = await resp.json();
+    if (!d || !Array.isArray(d.loaded) || d.loading) return;
+    // Reports of models that went away behind the server's back. The first
+    // poll only sets the baseline, so old reports are not replayed on reload.
+    const lost = Array.isArray(d.lost) ? d.lost : [];
+    const newest = lost.reduce((n, l) => Math.max(n, l.seq || 0), 0);
+    const fresh = _lostSeqSeen == null ? [] : lost.filter(l => (l.seq || 0) > _lostSeqSeen);
+    _lostSeqSeen = newest;
+
+    const shown = loadedSignature(_catalog.filter(m => m.loaded).map(m => m.name), _asrActive);
+    const actual = loadedSignature(d.loaded, d.asrModel);
+    const before = getSelectedChatModel();
+    if (shown !== actual) {
+      if (serverBusy()) return;                  // our own operation started meanwhile
+      await refreshCatalog();
+      const explained = new Set(fresh.map(l => l.name));
+      if (before && !d.loaded.includes(before) && !explained.has(before)) {
+        const next = getSelectedChatModel();
+        noteModelGone(before, 'it was unloaded outside this page'
+          + (next ? ` — now chatting with ${next}` : ''));
+      }
+    }
+    fresh.forEach(l => noteModelGone(l.name, l.reason || 'it stopped answering'));
+  } catch (e) {
+    /* keep what is shown; the next poll tries again */
+  } finally {
+    _residencyBusy = false;
+  }
+}
+
+function initResidencyWatch() {
+  if (_residencyTimer || !controlEnabled()) return;
+  _residencyTimer = setInterval(pollResidency, RESIDENCY_POLL_MS);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) pollResidency(); });
+}
+
+// The server refused a chat turn because the model is not loaded any more.
+function handleModelNotLoaded(data) {
+  activeGeneration = false;
+  receivedEndSignal = true;
+  pendingNewGenerationAudio = false;
+  shouldPlayAudio = false;
+  hideAbortButton();
+  const placeholders = chatMessages.querySelectorAll('.message.assistant.streaming-text');
+  const last = placeholders[placeholders.length - 1];
+  if (last && last === chatMessages.lastElementChild) last.remove();
+  addChatMessage(`⚠️ ${data.error || 'That model is no longer loaded.'}`, false, false);
+  refreshCatalog();
 }
 
 // ---- Live MLA memory ---------------------------------------------------

@@ -913,12 +913,17 @@ def stream_chat(oai, model, messages, max_tokens, render=False, think=True):
 
 
 # ---- several models at once ---------------------------------------------------
-def loaded_chat_models(ctrl):
-    """Names of the chat/VLM models loaded now, most recently used first."""
+def loaded_chat_models(ctrl, unknown=None):
+    """Names of the chat/VLM models loaded now, most recently used first.
+
+    Other clients of the model server (the web UI, the API) load and unload
+    models too, and the accelerator can be reset from outside, so this is asked
+    fresh rather than remembered. Returns ``unknown`` (default: an empty list)
+    when the server cannot be asked."""
     try:
         status = ctrl_get(ctrl, "/control/status") or {}
     except Exception:
-        return []
+        return [] if unknown is None else unknown
     resident = status.get("resident")
     if isinstance(resident, list):
         return [str(n) for n in resident]
@@ -3000,6 +3005,20 @@ def main():
 
         if not active:
             print(f"{ERR}  no model loaded — /models then /load <name>.{RESET}")
+            continue
+        # The active model may have been unloaded since the last turn by the
+        # web UI, the API or an accelerator reset. Check before sending, and
+        # do not quietly send the message to a different model.
+        still = loaded_chat_models(ctrl, unknown=False)
+        if still is not False and active not in still:
+            gone, active = active, (still[0] if still else "")
+            loaded_count = len(still)
+            print(f"{ERR}  {gone} is no longer loaded — it was unloaded outside this chat.{RESET}")
+            if active:
+                print(f"{MUTED}  now chatting with {active}; send your message again.{RESET}")
+            else:
+                camera_device = None
+                print(f"{MUTED}  /load a model, then send your message again.{RESET}")
             continue
 
         # Resolve the image for this turn. An explicit one-shot /image wins;

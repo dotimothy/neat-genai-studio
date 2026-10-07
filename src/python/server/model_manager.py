@@ -82,6 +82,8 @@ def parse_quantization(name: str) -> str | None:
 # Whisper builds are ~1.5 GB at most — an order of magnitude below a 7B VLM —
 # so they do not need the chat warm-up's 600s ceiling.
 _ASR_WARM_TIMEOUT_S = 300
+# A model that is really loaded answers a one-token probe in well under this.
+_VERIFY_TIMEOUT_S = 45
 
 # Seed for the load-time estimate, in seconds per GB of ELF stages. Measured on a
 # Modalix DevKit, where the observed rate spans roughly 1.2-2.7 s/GB depending on
@@ -180,6 +182,25 @@ def _dispatcher_pid() -> int | None:
         except OSError:
             continue
     return None
+
+
+def dispatcher_identity() -> tuple[int, int] | None:
+    """(pid, start time) of the MLA dispatcher, or None when it is not running.
+
+    The dispatcher holds every loaded model. A different identity than the one
+    seen when a model was loaded means it was restarted by something else, and
+    whatever it held is gone, even though this process still lists the model.
+    """
+    pid = _dispatcher_pid()
+    if pid is None:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            # The command name may contain spaces; the fields follow its ")".
+            fields = fh.read().rsplit(")", 1)[1].split()
+        return pid, int(fields[19])              # field 22: start time
+    except (OSError, IndexError, ValueError):
+        return pid, 0
 
 
 def read_dispatcher_maps() -> str | None:
@@ -308,6 +329,15 @@ class ModelManager:
         self._sec_per_gb: float | None = _DEFAULT_SEC_PER_GB   # learned rate for ETA
         # Optional stdout tap: real per-ELF load progress + a live loading log.
         self._log_tap = log_tap
+        # Models that turned out not to be loaded any more although nothing
+        # here unloaded them (see verify_loaded), newest last, for the UI.
+        self._lost: list[dict] = []
+        self._lost_seq = 0
+        # Registered names that failed verification and could not be removed
+        # from the runtime's registry either: reported as not loaded.
+        self._gone: set[str] = set()
+        self._dispatcher_seen = dispatcher_identity()
+        self._verifying = False
         # Last load failure, retained so the UI can surface it prominently.
         self._last_error: dict | None = None
         # Performance benchmark (web MoLE `perf`): TTFT/TPS over N passes.
@@ -450,9 +480,10 @@ class ModelManager:
         if server is None:
             return []
         try:
-            return list(server.model_names())
+            names = list(server.model_names())
         except Exception:
             return []
+        return [n for n in names if n not in self._gone] if self._gone else names
 
     def _catalog_type(self, name: str) -> str:
         with self._lock:
@@ -501,14 +532,122 @@ class ModelManager:
 
     def residency(self) -> dict:
         """Chat/VLM models resident now (most recently used first) and the limit."""
+        # Other clients of this server (another browser, the CLI, the API) load
+        # and unload models too, and the accelerator can be reset from outside:
+        # report what is loaded now, not what this object last did.
+        self._check_dispatcher()
+        self._sync_resident_from_server()
         with self._lock:
             state = {
                 "resident": list(self._resident),
                 "maxResident": self._max_resident,
                 "maxResidentLimit": MAX_RESIDENT_LIMIT,
+                "lost": list(self._lost),
+                "verifying": self._verifying,
             }
         state["mla"] = self.mla_memory()
         return state
+
+    def residency_status(self) -> dict:
+        """What is loaded right now, cheaply (no catalog rescan): for clients
+        that poll to notice changes they did not make themselves."""
+        state = self.residency()
+        state["loaded"] = self._server_model_names()
+        state["asrModel"] = self._active_asr
+        state["loading"] = bool(self._loading)
+        return state
+
+    # -- models that went away without being unloaded here ----------------------
+
+    def _check_dispatcher(self) -> None:
+        """Notice an accelerator reset this process did not ask for.
+
+        Cheap (two /proc reads), so it runs on every status call. When the
+        dispatcher's identity changed while models are registered, they are
+        verified in the background and the ones that no longer answer are
+        reported as lost.
+        """
+        current = dispatcher_identity()
+        if current is None or current == self._dispatcher_seen:
+            return                       # unchanged, or mid-restart: look again later
+        if self._dispatcher_seen is None:
+            self._dispatcher_seen = current          # first sighting
+            return
+        if self._loading or self._verifying:
+            return
+        self._dispatcher_seen = current
+        if not self._server_model_names():
+            return
+        logging.warning("the MLA dispatcher was restarted outside the studio; "
+                        "verifying the loaded models")
+        self._verifying = True
+        threading.Thread(
+            target=self._verify_quietly,
+            args=("the accelerator was reset by another program",),
+            name="verify-loaded", daemon=True).start()
+
+    def _verify_quietly(self, reason: str) -> None:
+        try:
+            self.verify_loaded(reason=reason)
+        except Exception:  # noqa: BLE001 - a background check must not crash
+            logging.exception("verifying the loaded models failed")
+        finally:
+            self._verifying = False
+
+    def verify_loaded(self, name: str | None = None, reason: str = "") -> dict:
+        """Check that the models the runtime lists really answer.
+
+        Each one gets a one-token request (speech models a short silent clip).
+        A model that no longer answers was unloaded behind our back, by an
+        accelerator reset or another program: it is taken out of the loaded
+        set and recorded in ``lost`` so clients can tell the user. Checks one
+        model when ``name`` is given, otherwise all of them.
+        """
+        name = (name or "").strip()
+        checked: list[str] = []
+        lost: list[str] = []
+        with self._op_lock:                       # never while a load or unload runs
+            for model in ([name] if name else self._server_model_names()):
+                if model not in self._server_model_names():
+                    continue
+                checked.append(model)
+                is_asr = self._catalog_type(model) == "asr" or model == self._active_asr
+                if is_asr:
+                    ok, detail = self._warm_check_asr(model, timeout=_VERIFY_TIMEOUT_S)
+                    # A 4xx is about the silent clip, not the model (see load()).
+                    ok = ok or self._is_probe_client_error(detail)
+                else:
+                    ok, detail = self._warm_check(model, timeout=_VERIFY_TIMEOUT_S)
+                if ok:
+                    self._gone.discard(model)
+                    continue
+                self._drop_lost(model, reason, detail)
+                lost.append(model)
+        return {"checked": checked, "lost": lost}
+
+    def _drop_lost(self, name: str, reason: str, detail: str) -> None:
+        """Forget a model that is registered but no longer on the accelerator."""
+        logging.error("model '%s' is no longer loaded (%s): %s", name, reason or "probe failed", detail)
+        try:
+            removed = bool(self._server.remove_model(name))
+        except Exception:  # noqa: BLE001 - the registry entry may be unremovable
+            removed = False
+        with self._lock:
+            if not removed:
+                self._gone.add(name)              # still registered: report it as not loaded
+            if name in self._resident:
+                self._resident.remove(name)
+            if name == self._active_asr:
+                self._active_asr = None
+            self._lost_seq += 1
+            self._lost.append({
+                "seq": self._lost_seq,
+                "name": name,
+                "reason": reason or "it stopped answering",
+                "detail": (detail or "")[:300],
+                "at": time.time(),
+            })
+            del self._lost[:-10]
 
     def mla_memory(self) -> dict:
         """Accelerator memory: the pool's size, how much of it the runtime is
@@ -755,6 +894,17 @@ class ModelManager:
                     time.sleep(self._switch_settle_s)
 
                 self._loading.update(phase="loading", victim=None)
+                if name in self._gone:
+                    # A stale registration from before an outside reset: clear
+                    # it so the model can be registered afresh.
+                    try:
+                        self._server.remove_model(name)
+                    except Exception:  # noqa: BLE001 - best effort
+                        pass
+                    self._gone.discard(name)
+                # Whatever is loaded from here on lives in the dispatcher that
+                # is running now.
+                self._dispatcher_seen = dispatcher_identity() or self._dispatcher_seen
                 # add_model returns the name the server actually served it under,
                 # which may differ from the requested one — that is the truth.
                 self._log_note(f"Registering {name} with the runtime…")
@@ -1480,7 +1630,7 @@ class ModelManager:
         except Exception:
             pass
 
-    def _warm_check(self, name: str) -> tuple[bool, str]:
+    def _warm_check(self, name: str, timeout: float = 600) -> tuple[bool, str]:
         """Send one throwaway request to trigger + verify the MLA load.
 
         Returns (ok, detail). ``ok`` is True on success; otherwise ``detail``
@@ -1499,7 +1649,7 @@ class ModelManager:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 resp.read()
             return True, ""
         except urllib.error.HTTPError as exc:
@@ -1539,7 +1689,7 @@ class ModelManager:
         body += content + b"\r\n" + f"--{boundary}--\r\n".encode("utf-8")
         return bytes(body), f"multipart/form-data; boundary={boundary}"
 
-    def _warm_check_asr(self, name: str) -> tuple[bool, str]:
+    def _warm_check_asr(self, name: str, timeout: float = _ASR_WARM_TIMEOUT_S) -> tuple[bool, str]:
         """Force an ASR model's deferred MLA load by transcribing silence.
 
         The chat ``_warm_check`` sends a completion an ASR model cannot serve,
@@ -1558,7 +1708,7 @@ class ModelManager:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=_ASR_WARM_TIMEOUT_S) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 resp.read()
             return True, ""
         except urllib.error.HTTPError as exc:

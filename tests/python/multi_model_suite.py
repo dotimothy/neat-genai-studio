@@ -195,6 +195,137 @@ class ResidentLimitTests(ModelDirsCase):
         self.assertEqual(status["maxResidentLimit"], MAX_RESIDENT_LIMIT)
 
 
+class LoadedStateIsCheckedTests(ModelDirsCase):
+    """Models can go away without this manager unloading them: another client
+    of the runtime, or an accelerator reset by another program."""
+
+    class Inline:
+        """Stands in for threading.Thread: runs the target at start()."""
+
+        def __init__(self, target=None, args=(), **_kw):
+            self._target, self._args = target, args
+
+        def start(self):
+            self._target(*self._args)
+
+    def probes(self, chat=None, asr=(True, "")):
+        """Patch the two probes. `chat` maps a model name to its (ok, detail)."""
+        chat = chat or {}
+        return (patch.object(ModelManager, "_warm_check",
+                             side_effect=lambda name, timeout=600: chat.get(name, (True, ""))),
+                patch.object(ModelManager, "_warm_check_asr",
+                             side_effect=lambda name, timeout=300: asr))
+
+    def test_a_model_removed_by_another_client_is_no_longer_reported(self):
+        manager, server = self.manager(2)
+        manager.load("model-a")
+        manager.load("model-b")
+        server.names.remove("model-a")                 # someone else unloaded it
+        status = manager.residency_status()
+        self.assertEqual(status["resident"], ["model-b"])
+        self.assertNotIn("model-a", status["loaded"])
+        self.assertEqual(status["lost"], [])            # an ordinary unload, not a loss
+
+    def test_a_model_loaded_by_another_client_shows_up(self):
+        manager, server = self.manager(2)
+        manager.load("model-a")
+        server.names.append("model-b")
+        self.assertEqual(manager.residency_status()["resident"], ["model-a", "model-b"])
+
+    def test_verify_drops_only_the_model_that_stopped_answering(self):
+        manager, server = self.manager(2)
+        manager.load("model-a")
+        manager.load("model-b")
+        chat, asr = self.probes({"model-a": (False, "HTTP 500: mlashm handle is invalid")})
+        with chat, asr:
+            result = manager.verify_loaded(reason="the accelerator was reset by another program")
+        self.assertEqual(result["lost"], ["model-a"])
+        self.assertEqual(sorted(result["checked"]), ["model-a", "model-b", ASR])
+        status = manager.residency_status()
+        self.assertEqual(status["resident"], ["model-b"])
+        self.assertNotIn("model-a", server.model_names())
+        self.assertEqual(manager.active_asr(), ASR)
+        self.assertEqual([(l["name"], l["reason"]) for l in status["lost"]],
+                         [("model-a", "the accelerator was reset by another program")])
+        self.assertEqual(status["lost"][0]["seq"], 1)
+
+    def test_verify_one_model_by_name(self):
+        manager, _ = self.manager(2)
+        manager.load("model-a")
+        manager.load("model-b")
+        chat, asr = self.probes({"model-b": (False, "timed out")})
+        with chat, asr:
+            self.assertEqual(manager.verify_loaded("model-a"), {"checked": ["model-a"], "lost": []})
+            self.assertEqual(manager.verify_loaded("model-b")["lost"], ["model-b"])
+            self.assertEqual(manager.verify_loaded("model-b"), {"checked": [], "lost": []})
+
+    def test_a_lost_model_the_runtime_will_not_remove_is_still_reported_unloaded(self):
+        manager, server = self.manager(2)
+        manager.load("model-a")
+        chat, asr = self.probes({"model-a": (False, "connection reset")})
+        with chat, asr, patch.object(server, "remove_model", return_value=False):
+            manager.verify_loaded()
+        self.assertIn("model-a", server.model_names())             # still registered
+        self.assertNotIn("model-a", manager.residency_status()["loaded"])
+        self.assertFalse(next(e for e in manager.catalog() if e["name"] == "model-a")["loaded"])
+        manager.load("model-a")                                    # loading it again recovers
+        self.assertEqual(manager.residency()["resident"], ["model-a"])
+
+    def test_a_speech_probe_rejecting_the_silent_clip_is_not_a_loss(self):
+        manager, _ = self.manager(1)
+        chat, asr = self.probes(asr=(False, "HTTP 400: bad audio"))
+        with chat, asr:
+            self.assertEqual(manager.verify_loaded()["lost"], [])
+        self.assertEqual(manager.active_asr(), ASR)
+
+    def test_a_lost_speech_model_is_no_longer_active(self):
+        manager, _ = self.manager(1)
+        chat, asr = self.probes(asr=(False, "HTTP 500: mlashm handle is invalid"))
+        with chat, asr:
+            self.assertEqual(manager.verify_loaded()["lost"], [ASR])
+        self.assertIsNone(manager.active_asr())
+
+    def test_an_outside_accelerator_reset_triggers_verification(self):
+        with patch("server.model_manager.dispatcher_identity", return_value=(100, 5)):
+            manager, _ = self.manager(2)
+            manager.load("model-a")
+            manager.load("model-b")
+            self.assertEqual(manager.residency()["lost"], [])      # same dispatcher: nothing to do
+        chat, asr = self.probes({"model-a": (False, "HTTP 500: mlashm"), "model-b": (False, "HTTP 500: mlashm")},
+                                asr=(False, "HTTP 500: mlashm"))
+        with patch("server.model_manager.dispatcher_identity", return_value=(222, 9)), \
+                patch("server.model_manager.threading.Thread", self.Inline), chat, asr:
+            status = manager.residency_status()
+        self.assertEqual(status["resident"], [])
+        self.assertEqual(status["loaded"], [])
+        self.assertEqual(sorted(l["name"] for l in status["lost"]), ["model-a", "model-b", ASR])
+        self.assertTrue(all("reset by another program" in l["reason"] for l in status["lost"]))
+        self.assertFalse(status["verifying"])
+
+    def test_models_that_survive_the_check_stay_loaded(self):
+        with patch("server.model_manager.dispatcher_identity", return_value=(100, 5)):
+            manager, _ = self.manager(1)
+            manager.load("model-a")
+        chat, asr = self.probes()
+        with patch("server.model_manager.dispatcher_identity", return_value=(222, 9)), \
+                patch("server.model_manager.threading.Thread", self.Inline), chat as probe, asr:
+            first = manager.residency_status()
+            manager.residency_status()                 # the new dispatcher is adopted: no re-check
+        self.assertEqual(first["resident"], ["model-a"])
+        self.assertEqual(first["lost"], [])
+        self.assertEqual(probe.call_count, 1)
+
+    def test_a_dispatcher_that_is_down_is_not_mistaken_for_a_reset(self):
+        with patch("server.model_manager.dispatcher_identity", return_value=(100, 5)):
+            manager, _ = self.manager(1)
+            manager.load("model-a")
+        chat, asr = self.probes()
+        with patch("server.model_manager.dispatcher_identity", return_value=None), \
+                patch("server.model_manager.threading.Thread", self.Inline), chat as probe, asr:
+            self.assertEqual(manager.residency_status()["resident"], ["model-a"])
+        self.assertEqual(probe.call_count, 0)
+
+
 class UnloadTimingTests(ModelDirsCase):
     """Unloads are timed so clients can show progress for the next one."""
 

@@ -511,6 +511,7 @@ GET  /models/status, /models/catalog; POST /models/load, /models/unload, /models
 POST /models/max-resident {"limit": n}   how many chat/VLM models stay loaded together
 POST /models/unload-all                  unload every chat/VLM model (speech-to-text stays)
 POST /models/active {"name": "..."}      mark a loaded model most recently used (evicted last)
+GET  /models/residency                   what is loaded right now, the limit, and models lost to an outside reset
 GET  /models/memory                      accelerator memory: pool size, held by the runtime, per-model estimates
 POST /compare/stream {"turn", "model"}   one model's streamed answer to a side-by-side turn (the web UI's Compare)
 POST /compare/choose {"turn", "answer"}  record which answer the conversation continues from
@@ -638,6 +639,31 @@ With two or more loaded:
 The choice lasts until the Studio restarts.
 `server.models.max_resident_chat_models` in `config.local.yaml` (or
 `MAX_RESIDENT_CHAT_MODELS` at setup) is the value it starts with.
+
+### When a model is unloaded outside the Studio
+The Studio does not assume a model is still loaded because it loaded it. Other
+things unload models too: another browser session, the terminal chat, a client
+of the API, or another program resetting the accelerator.
+
+- The web page asks the model server what is loaded every three seconds and
+  refreshes when that differs from what it shows. If the model you are
+  chatting with has gone, it says so in the conversation and moves to another
+  loaded model, or locks the composer when none is left.
+- Every chat turn is checked against what is loaded at that moment. A turn for
+  a model that has gone is refused with a message that says so (HTTP 409 from
+  `/upload`), rather than failing partway through. The terminal chat checks
+  the same way before each message and does not quietly send it to a different
+  model.
+- The model server watches the MLA dispatcher, which holds every loaded model.
+  If it is restarted by something other than the Studio, the server sends each
+  model it still lists a one-token request (speech models a short silent
+  clip). Any that no longer answer are reported as unloaded, with the reason
+  *the accelerator was reset by another program*. The same check runs for a
+  model whose generation fails.
+
+A model the accelerator dropped can simply be loaded again. If loads then fail
+as well, the model server has lost its connection to the dispatcher: use
+**Reset MLA**, which restarts both.
 
 ### Switch the speech-to-text model
 The same tab lists your speech-to-text (ASR) models in their own

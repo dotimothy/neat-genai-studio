@@ -68,6 +68,10 @@ class _ControlHandler(BaseHTTPRequestHandler):
         try:
             if path == "/control/status":
                 self._send_json(self.manager.status())
+            elif path == "/control/residency":
+                # What is loaded now, without a catalog rescan: polled by
+                # clients to notice changes made elsewhere.
+                self._send_json(self.manager.residency_status())
             elif path == "/control/memory":
                 # Accelerator memory only: cheap enough to poll, unlike the
                 # status call, which rescans the catalog.
@@ -100,6 +104,8 @@ class _ControlHandler(BaseHTTPRequestHandler):
                 self._send_json(self.manager.set_active_asr(str(body.get("name", ""))))
             elif path == "/control/unload":
                 self._send_json(self.manager.unload(str(body.get("name", ""))))
+            elif path == "/control/verify":
+                self._send_json(self.manager.verify_loaded(str(body.get("name", ""))))
             elif path == "/control/unload_all":
                 self._send_json(self.manager.unload_all())
             elif path == "/control/delete":
