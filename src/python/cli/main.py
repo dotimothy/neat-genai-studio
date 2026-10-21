@@ -28,6 +28,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Board-camera capture is shared with the Flask UI backend.
+from shared.repetition import LoopDetector  # noqa: E402
 from shared.board_camera import capture_camera_frame, default_camera_device, cam_label as _cam_label  # noqa: E402
 
 
@@ -544,7 +545,7 @@ def load_config(config_path):
     """Return ((ctrl_host, ctrl_port), (oai_host, oai_port), max_tokens)."""
     ctrl = ("127.0.0.1", 9997)
     oai = ("127.0.0.1", 9998)
-    max_tokens = 512
+    max_tokens = 8192
     try:
         import yaml
         with open(config_path, "r", encoding="utf-8") as fh:
@@ -674,9 +675,11 @@ class _ThinkSplitter:
     # trace longer than the hold is reclassified when its </think> arrives.
     HOLD_CHARS = 160
 
-    def __init__(self):
-        self.in_think = False
-        self.saw_open = False
+    def __init__(self, opens_thinking=False):
+        # opens_thinking: the catalog says the model's prompt already opened
+        # <think> (DeepSeek-R1), so the reply starts as reasoning — no guessing.
+        self.in_think = bool(opens_thinking)
+        self.saw_open = bool(opens_thinking)
         self.decided = False      # the undecided prefix has been released as answer
         self.pending = ""
 
@@ -747,7 +750,8 @@ class _ThinkSplitter:
         return [("think" if self.in_think else "answer", rest)] if rest else []
 
 
-def stream_chat(oai, model, messages, max_tokens, render=False, think=True):
+def stream_chat(oai, model, messages, max_tokens, render=False, think=True,
+                opens_thinking=False):
     """Stream a completion. Returns (text, ttft_seconds, tps, tokens,
     reasoning_tokens). ``text`` is the answer with any reasoning block removed.
     With render=True the response is shown live, rendered as Markdown line-by-line
@@ -756,7 +760,9 @@ def stream_chat(oai, model, messages, max_tokens, render=False, think=True):
     count trails the current line. With render=False raw tokens are printed as
     they arrive. Reasoning (``<think>…</think>``) streams dimmed, is counted
     separately, and is kept out of the returned text. With think=False the
-    request asks the model not to reason, the way the web UI's toggle does."""
+    request asks the model not to reason, the way the web UI's toggle does.
+    ``opens_thinking``: the model's template opens <think> itself (see
+    ``model_opens_thinking``), so the reply is reasoning from its first token."""
     payload = {"model": model,
                "messages": messages if think else _without_thinking(messages),
                "max_tokens": max_tokens, "stream": True}
@@ -768,7 +774,8 @@ def stream_chat(oai, model, messages, max_tokens, render=False, think=True):
         headers={"Content-Type": "application/json"}, method="POST")
     parts, ttft, tps, tokens = [], None, None, 0
     reasoning_tokens, think_open, held_deltas = 0, False, 0
-    splitter = _ThinkSplitter()
+    splitter = _ThinkSplitter(opens_thinking)
+    loop = LoopDetector()
     buf, md_state = "", [False, False]   # render: [in code fence, in $$ math block]
     # Until the first token arrives (a second or more with an image attached),
     # show that the request is in flight rather than a bare cursor.
@@ -888,6 +895,14 @@ def stream_chat(oai, model, messages, max_tokens, render=False, think=True):
                 else:
                     sys.stdout.write(piece)
                     sys.stdout.flush()
+            # The runtime decodes greedily, and a small reasoning model can
+            # repeat one passage until the token limit: stop it there.
+            if loop.feed(clean):
+                try:
+                    _http(f"http://{oai[0]}:{oai[1]}/stop", {"model": model}, timeout=5)
+                except Exception:
+                    pass
+                break
     _stop_waiting()                                 # a reply with no visible text
     for kind, piece in splitter.flush():
         if kind == "think":
@@ -909,6 +924,8 @@ def stream_chat(oai, model, messages, max_tokens, render=False, think=True):
             print(render_md_line(buf, md_state))   # render the last (unterminated) line
         else:
             sys.stdout.flush()
+    if loop.looped:
+        print(f"{MUTED}(stopped: {LOOP_NOTE}){RESET}")
     return "".join(parts), ttft, tps, tokens, reasoning_tokens
 
 
@@ -1018,9 +1035,20 @@ def _without_images(messages):
     return out
 
 
-def _answer_only(text):
+def model_opens_thinking(ctrl, model, think=True):
+    """Whether the catalog says ``model``'s generation prompt already opens
+    <think> (with thinking on, or off when ``think`` is False)."""
+    entry = next((m for m in catalog(ctrl) if m.get("name") == model), {}) or {}
+    return bool(entry.get("opensThinking" if think else "opensThinkingWhenOff"))
+
+
+LOOP_NOTE = ("it kept repeating the same passage; the board decodes greedily, "
+             "so a small reasoning model can get stuck. Try asking in other words")
+
+
+def _answer_only(text, opens_thinking=False):
     """A finished reply with any reasoning block removed."""
-    splitter = _ThinkSplitter()
+    splitter = _ThinkSplitter(opens_thinking)
     answer = []
     for kind, piece in list(splitter.feed(text)) + list(splitter.flush()):
         if kind == "reclassify":
@@ -1034,9 +1062,12 @@ class BackgroundReply(threading.Thread):
     """One model's reply to a side-by-side turn, collected off-screen while the
     active model's reply streams to the terminal."""
 
-    def __init__(self, oai, model, messages, max_tokens, think=True):
+    def __init__(self, oai, model, messages, max_tokens, think=True, opens_thinking=False):
         super().__init__(name=f"reply-{model}", daemon=True)
         self.model, self.tokens, self.raw = model, 0, ""
+        self.opens_thinking = opens_thinking
+        self.looped = False
+        self._loop = LoopDetector()
         self.ttft = self.tps = self.error = self.seconds = None
         self._response = None
         payload = {"model": model,
@@ -1052,7 +1083,7 @@ class BackgroundReply(threading.Thread):
 
     @property
     def answer(self):
-        return _answer_only(self.raw)
+        return _answer_only(self.raw, self.opens_thinking)
 
     def run(self):
         started = time.monotonic()
@@ -1082,6 +1113,11 @@ class BackgroundReply(threading.Thread):
                     if clean:
                         self.tokens += 1
                         self.raw += clean
+                        if self._loop.feed(clean):
+                            self.looped = True
+                            self.raw = self.raw[:self._loop.keep]
+                            self.cancel()
+                            break
         except urllib.error.HTTPError as exc:
             self.error = f"HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')[:200]}"
         except Exception as exc:  # noqa: BLE001 - reported with the reply
@@ -1135,6 +1171,8 @@ def show_background_replies(jobs, render):
             continue
         answer = job.answer
         print(render_markdown_ansi(answer) if render else answer)
+        if job.looped:
+            print(f"{MUTED}(stopped: {LOOP_NOTE}){RESET}")
         stats = reply_stats(job.tokens, job.ttft, job.tps)
         if stats:
             print(f"{DIM}{stats}{RESET}")
@@ -1610,7 +1648,7 @@ def load_model(ctrl, name, oai=None, auto_retry=True):
 def _hub_config(config_path):
     """Read catalog_dir + Hugging Face settings from the config."""
     from pathlib import Path
-    catalog_dir, allow, orgs = None, True, ("simaai", "TDoSiMa", "florianvoss")
+    catalog_dir, allow, orgs = None, True, ("dotimothy", "simaai", "florianvoss")
     try:
         import yaml
         with open(config_path, "r", encoding="utf-8") as fh:
@@ -3084,7 +3122,8 @@ def main():
                           if turn_image is not None else {})
                 jobs = [BackgroundReply(
                     oai, m, msgs if (turn_image is None or vision.get(m)) else _without_images(msgs),
-                    max_tokens, think=think) for m in others]
+                    max_tokens, think=think, opens_thinking=model_opens_thinking(ctrl, m, think))
+                    for m in others]
             else:
                 print(f"{MUTED}  compare is on, but only {active} is loaded — it answers alone.{RESET}")
         turn_started = time.monotonic()
@@ -3097,7 +3136,8 @@ def main():
             print(f"{TEAL}{BOLD}neat ◂{RESET}{who} ", end="", flush=True)
         try:
             text, ttft, tps, tokens, reasoning_tokens = stream_chat(
-                oai, active, msgs, max_tokens, render=render, think=think)
+                oai, active, msgs, max_tokens, render=render, think=think,
+                opens_thinking=model_opens_thinking(ctrl, active, think))
         except KeyboardInterrupt:
             try:
                 _http(f"http://{oai[0]}:{oai[1]}/stop", {"model": active}, timeout=5)

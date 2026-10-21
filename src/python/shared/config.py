@@ -94,7 +94,7 @@ class ControlConfig:
 @dataclass(frozen=True)
 class HubConfig:
     allow_download: bool
-    orgs: tuple[str, ...] = ("simaai", "TDoSiMa", "florianvoss")
+    orgs: tuple[str, ...] = ("dotimothy", "simaai", "florianvoss")
 
     @property
     def org(self) -> str:
@@ -122,7 +122,7 @@ class AppConfig:
     catalog_dir: Path | None = None
     max_resident_chat_models: int = 1
     hub: HubConfig = HubConfig(allow_download=True,
-                              orgs=("simaai", "TDoSiMa", "florianvoss"))
+                              orgs=("dotimothy", "simaai", "florianvoss"))
     ui: UIConfig = UIConfig(font_family="Inter", font_size=15)
     supertonic: SupertonicConfig = SupertonicConfig()
 
@@ -155,7 +155,7 @@ def load_server_config(path: Path = DEFAULT_SERVER_CONFIG, apps_root: Path = PAT
         chat_models=chat_models,
         asr_model=_load_optional_model(models, "asr", apps_root),
         request=RequestConfig(
-            max_tokens=int(request.get("max_tokens", 512)),
+            max_tokens=int(request.get("max_tokens", 8192)),
             system_prompt=str(request.get("system_prompt", "") or ""),
         ),
         web=WebConfig(
@@ -225,7 +225,7 @@ def load_ui_config(path: Path = DEFAULT_UI_CONFIG, apps_root: Path = PATH_ROOT) 
         chat_models=chat_models,
         asr_model=_load_optional_model_name(server_models, "asr"),
         request=RequestConfig(
-            max_tokens=int(request.get("max_tokens", 512)),
+            max_tokens=int(request.get("max_tokens", 8192)),
             system_prompt=str(request.get("system_prompt", "") or ""),
         ),
         web=WebConfig(
@@ -545,7 +545,7 @@ def _load_control_config(raw: object) -> ControlConfig:
 
 def _load_hub_config(raw: object) -> HubConfig:
     hub = raw if isinstance(raw, dict) else {}
-    raw_orgs = hub.get("orgs", hub.get("org", ["simaai", "TDoSiMa", "florianvoss"]))
+    raw_orgs = hub.get("orgs", hub.get("org", ["dotimothy", "simaai", "florianvoss"]))
     if isinstance(raw_orgs, str):
         orgs = tuple(o.strip() for o in raw_orgs.replace(",", " ").split() if o.strip())
     elif isinstance(raw_orgs, (list, tuple)):
@@ -553,7 +553,7 @@ def _load_hub_config(raw: object) -> HubConfig:
     else:
         orgs = ()
     if not orgs:
-        orgs = ("simaai", "TDoSiMa", "florianvoss")
+        orgs = ("dotimothy", "simaai", "florianvoss")
     return HubConfig(
         allow_download=_load_bool(hub.get("allow_download", True)),
         orgs=orgs,

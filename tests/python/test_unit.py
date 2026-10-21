@@ -50,6 +50,22 @@ from multi_model_suite import (  # noqa: E402,F401
     ResidentLimitTests,
     UnloadTimingTests,
 )
+from think_template_suite import (  # noqa: E402,F401
+    CatalogReportsOpenedThinkingTests,
+    CliOpenedThinkingTests,
+    TemplateOpensThinkingTests,
+)
+from context_length_suite import (  # noqa: E402,F401
+    CatalogContextLengthTests,
+)
+from loop_guard_suite import (  # noqa: E402,F401
+    CliLoopGuardTests,
+    LoopDetectorTests,
+)
+from mla_reclaim_suite import (  # noqa: E402,F401
+    DispatcherClientTests as MlaDispatcherClientTests,
+    ReclaimTests as MlaReclaimTests,
+)
 from cli_think_suite import (  # noqa: E402,F401
     LiveStatusLineTests as CliLiveStatusLineTests,
     NoThinkRewriteTests as CliNoThinkRewriteTests,

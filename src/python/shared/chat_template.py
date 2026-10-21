@@ -22,6 +22,12 @@ templates are rewritten into minja-parseable form (originals backed up), and
 when ``devkit/`` ends up with no usable template a valid root-level one is
 mirrored into it. Stdlib only, safe to call from both the UI and model-server
 processes.
+
+``generation_opens_thinking`` answers a different question about the same
+template: whether its generation prompt already opens a ``<think>`` block, as
+DeepSeek-R1's does. Such a model streams its reasoning with no opening tag and
+only emits ``</think>``. It renders the template with Jinja2 when that is
+installed and reports False otherwise.
 """
 
 from __future__ import annotations
@@ -128,6 +134,88 @@ def _embedded_template(config_path: Path) -> str | None:
     except (json.JSONDecodeError, AttributeError):
         return None
     return value if isinstance(value, str) else None
+
+
+def _json_template(path: Path) -> str | None:
+    """The chat_template string inside a chat_template.json, if any."""
+    text = _read_text(path)
+    if text is None:
+        return None
+    try:
+        value = json.loads(text).get("chat_template")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def runtime_chat_template(model_dir) -> str | None:
+    """The chat template the runtime will use, in its own lookup order."""
+    devkit = Path(model_dir) / "devkit"
+    jinja_file = devkit / "chat_template.jinja"
+    if jinja_file.is_file():
+        text = _read_text(jinja_file)
+        if looks_like_chat_template(text):
+            return text
+    json_file = devkit / "chat_template.json"
+    if json_file.is_file():
+        template = _json_template(json_file)
+        if looks_like_chat_template(template):
+            return template
+    template = _embedded_template(devkit / "tokenizer_config.json")
+    return template if looks_like_chat_template(template) else None
+
+
+def _special_token(config: dict, key: str) -> str:
+    value = config.get(key)
+    if isinstance(value, dict):          # {"content": "<s>", ...} in older configs
+        value = value.get("content")
+    return value if isinstance(value, str) else ""
+
+
+def generation_opens_thinking(model_dir, enable_thinking: bool | None = None) -> bool:
+    """Whether the generation prompt ends inside an open ``<think>`` block.
+
+    Renders the template for one user turn with ``add_generation_prompt`` the
+    way transformers does. ``enable_thinking`` is passed to the template only
+    when given, matching a request with or without
+    ``chat_template_kwargs={"enable_thinking": False}``. False whenever the
+    template is missing or cannot be rendered.
+    """
+    template = runtime_chat_template(model_dir)
+    if not template or "<think>" not in template:
+        return False
+    try:
+        from jinja2.exceptions import TemplateError
+        from jinja2.sandbox import ImmutableSandboxedEnvironment
+    except ImportError:
+        return False
+
+    def raise_exception(message):
+        raise TemplateError(message)
+
+    try:
+        config = json.loads(_read_text(Path(model_dir) / "devkit" / "tokenizer_config.json") or "{}")
+    except json.JSONDecodeError:
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+    env.globals["raise_exception"] = raise_exception
+    env.globals["strftime_now"] = lambda fmt: __import__("time").strftime(fmt)
+    env.filters["tojson"] = lambda value, **_: json.dumps(value, ensure_ascii=False)
+    context = {
+        "messages": [{"role": "user", "content": "Hi"}],
+        "add_generation_prompt": True,
+        "bos_token": _special_token(config, "bos_token"),
+        "eos_token": _special_token(config, "eos_token"),
+    }
+    if enable_thinking is not None:
+        context["enable_thinking"] = enable_thinking
+    try:
+        rendered = env.from_string(template).render(**context)
+    except Exception:
+        return False
+    return rendered.rstrip().endswith("<think>")
 
 
 def _has_usable_template(devkit: Path) -> bool:

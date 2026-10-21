@@ -39,8 +39,8 @@ CHAT_MODEL_NAME="${CHAT_MODEL_NAME:-${CHAT_MODEL_REPO##*/}}"
 MAX_RESIDENT_CHAT_MODELS="${MAX_RESIDENT_CHAT_MODELS:-1}"
 ALLOW_HUB_DOWNLOAD="${ALLOW_HUB_DOWNLOAD:-true}"
 # Hugging Face accounts searched for compatible models (space-separated):
-# simaai (official precompiled) + TDoSiMa and florianvoss (community).
-HUB_ORGS="${HUB_ORGS:-simaai TDoSiMa florianvoss}"
+# simaai (official precompiled) + dotimothy and florianvoss (community).
+HUB_ORGS="${HUB_ORGS:-dotimothy simaai florianvoss}"
 INSTALL_TTS_VOICES="${INSTALL_TTS_VOICES:-1}"
 DEFAULT_TTS_LANGUAGES="en,de,es,fr,it,ja,pt,vi,zh"
 TTS_LANGUAGES="${TTS_LANGUAGES:-}"
@@ -670,7 +670,7 @@ else
   ASR_YAML="    # asr: omitted — no speech-to-text model is preloaded."
 fi
 
-# Render "simaai TDoSiMa" -> "simaai, TDoSiMa" for the YAML flow list.
+# Render "dotimothy simaai" -> "dotimothy, simaai" for the YAML flow list.
 HUB_ORGS_YAML="$(echo "${HUB_ORGS}" | tr -s ' ' | sed 's/^ //; s/ $//; s/ /, /g')"
 section "Configuration"
 step "Writing local config: ${C_DIM}${CONFIG_PATH}${C_RESET}"
@@ -726,7 +726,7 @@ app:
     port: 9997
 
   request:
-    max_tokens: 512
+    max_tokens: 8192
     system_prompt: >-
       Answer clearly and concisely. Use Markdown formatting when it helps.
       Answer the question in the language it was asked in.

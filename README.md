@@ -172,7 +172,7 @@ Other useful environment variables:
 - `ALLOW_HUB_DOWNLOAD`: `true`/`false` to enable/disable in-UI Hugging Face
   downloads (default `true`).
 - `HUB_ORGS`: space-separated Hugging Face accounts the in-UI browser searches
-  (default `simaai TDoSiMa florianvoss`). Only listed accounts can be downloaded
+  (default `dotimothy simaai florianvoss`). Only listed accounts can be downloaded
   from.
 - `TTS_LANGUAGES`: comma- or space-separated catalogued server-TTS languages to
   install. Interactive setup prompts when this is unset; non-interactive setup
@@ -218,7 +218,7 @@ server:
       #   path: /media/nvme/llima/models/whisper-small-a16w8
   hub:
     allow_download: true
-    orgs: [simaai, TDoSiMa, florianvoss]
+    orgs: [dotimothy, simaai, florianvoss]
 ```
 
 Any compatible model directory (one containing `devkit/` with `vlm_config.json`
@@ -736,7 +736,7 @@ request outright.
 When the board is online, the **Settings → Add Model** tab appears (it's hidden
 offline). It lists compatible models *available to download* from the Hugging Face
 accounts in `server.hub.orgs` — `simaai` (official precompiled) plus the
-`TDoSiMa` and `florianvoss` community accounts — each with a **download size**
+`dotimothy` and `florianvoss` community accounts — each with a **download size**
 badge (⬇ so you know how much space it needs) and a **`💾 NVMe storage: … free`**
 readout so you can tell whether it will fit. Filter by account, type
 (LLM / VLM / ASR), parameter count or family, search, click **Download**, watch

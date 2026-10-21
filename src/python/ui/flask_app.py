@@ -40,6 +40,7 @@ import socket
 import subprocess
 
 from shared.config import HubConfig
+from shared.repetition import LoopDetector
 from shared.board_camera import (
     capture_camera_frame,
     default_camera_device,
@@ -1143,7 +1144,7 @@ class AppContext:
         self.control_base_url = "http://127.0.0.1:9997"
         self.catalog_dir = None
         self.hub_config = HubConfig(allow_download=True,
-                                    orgs=("simaai", "TDoSiMa", "florianvoss"))
+                                    orgs=("dotimothy", "simaai", "florianvoss"))
         self.ui_font_family = "Inter"
         self.ui_font_size = 15
         # Side-by-side turns: the request every loaded model is answering, kept
@@ -1153,6 +1154,11 @@ class AppContext:
         self._catalog_names_cache = (0.0, frozenset())
         # Vision support per catalog model, refreshed with the names above.
         self._catalog_vision = {}
+        # name -> (opensThinking, opensThinkingWhenOff) from the catalog.
+        self._catalog_opens_thinking = {}
+        # Whether the reply being streamed starts inside <think> (see
+        # model_opens_thinking); set per generation, read when it is stored.
+        self.current_opens_thinking = False
         self._asr_name_cache = (0.0, "")
 
         # Conversation history for OpenAI-style chat
@@ -1232,7 +1238,14 @@ class AppContext:
         # Store only the answer in history — the model's <think> reasoning should
         # not be fed back on later turns (it bloats context and, for reasoning
         # models like Qwen3, degrades quality).
-        stored = _answer_part(self.current_response).strip() or self.current_response
+        # A reply cut off inside its reasoning (token limit, Stop, a loop) has
+        # no answer: store it empty rather than feed the reasoning back.
+        # DeepSeek-R1's template strips only reasoning that ends in </think>,
+        # so an unfinished one would go back to the model whole, loop and all.
+        answer = _answer_part(self.current_response, self.current_opens_thinking).strip()
+        reasoning_only = (self.current_opens_thinking
+                          or '<think>' in self.current_response)
+        stored = answer if (answer or reasoning_only) else self.current_response
         if self.llm_only:
             assistant_content = stored
         else:
@@ -1298,12 +1311,13 @@ class AppContext:
             turn["assistant_msg"] = message
             return 'recorded'
 
-    def start_assistant_response(self, generation_id):
+    def start_assistant_response(self, generation_id, opens_thinking=False):
         """Start accumulating a new assistant response."""
         with self._state_lock:
             if self._active_generation_id != generation_id:
                 return False
             self.current_response = ""
+            self.current_opens_thinking = bool(opens_thinking)
             return True
 
     def add_to_current_response(self, generation_id, text):
@@ -1312,6 +1326,15 @@ class AppContext:
             if self._active_generation_id != generation_id:
                 return False
             self.current_response += text
+            return True
+
+    def cut_looped_response(self, generation_id, keep):
+        """The reply fell into a loop and was stopped: keep it up to the end of
+        the passage's first copy, so the repeats never reach history."""
+        with self._state_lock:
+            if self._active_generation_id != generation_id:
+                return False
+            self.current_response = self.current_response[:keep]
             return True
 
     def finish_assistant_response(self, generation_id):
@@ -1394,6 +1417,11 @@ class AppContext:
                 entry.get("name", ""): bool(entry.get("supportsVision"))
                 for entry in catalog if entry.get("type") != "asr"
             }
+            self._catalog_opens_thinking = {
+                entry.get("name", ""): (bool(entry.get("opensThinking")),
+                                        bool(entry.get("opensThinkingWhenOff")))
+                for entry in catalog if entry.get("type") != "asr"
+            }
         except Exception:
             names = frozenset()
         self._catalog_names_cache = (time.monotonic(), names)
@@ -1440,6 +1468,19 @@ class AppContext:
             return bool(caps.get("supportsVision"))
         self._known_catalog_names()
         return self._catalog_vision.get(model_name, True)
+
+    def model_opens_thinking(self, model_name, no_think=False):
+        """Whether this model's replies start inside an unopened <think> block.
+
+        True for templates whose generation prompt already opens it
+        (DeepSeek-R1): the model streams its reasoning with no opening tag and
+        only emits </think>. Unknown models are treated as not opening it.
+        """
+        self._known_catalog_names()
+        flags = self._catalog_opens_thinking.get(model_name)
+        if not flags:
+            return False
+        return flags[1] if no_think else flags[0]
 
     def set_asr_model_name(self, name):
         """Point transcription at a new ASR model after a successful switch."""
@@ -2249,8 +2290,12 @@ class AppContext:
             _normalize_openai_image_parts(payload)
             return _relay_chat_completion(payload)
 
-        def _relay_chat_completion(payload):
-            """Stream one chat completion from the model server to the browser."""
+        def _relay_chat_completion(payload, stop_loops=False):
+            """Stream one chat completion from the model server to the browser.
+
+            ``stop_loops``: watch the reply and end it once it is repeating one
+            passage (see shared.repetition), telling the page with a final
+            ``{"studio_stopped": "loop"}`` event before ``[DONE]``."""
             url = f"http://{self.app.config['SIMAAI_IP_ADDR']}/v1/chat/completions"
             try:
                 upstream = requests.post(url, json=payload, stream=True, timeout=(10, 600))
@@ -2259,10 +2304,23 @@ class AppContext:
                 return jsonify({'error': 'model server unreachable'}), 502
 
             def relay():
+                loop = LoopDetector() if stop_loops else None
+                pending = b''
                 try:
                     for chunk in upstream.iter_content(chunk_size=None):
-                        if chunk:
-                            yield chunk
+                        if not chunk:
+                            continue
+                        yield chunk
+                        if loop is None:
+                            continue
+                        pending += chunk
+                        *lines, pending = pending.split(b'\n')
+                        if any(loop.feed(_sse_delta_text(line)) for line in lines):
+                            logging.info(f"Stopping {payload.get('model')}: the reply is repeating itself")
+                            post_stop_to_sima(payload.get('model'))
+                            yield (b'\n\ndata: ' + json.dumps({'studio_stopped': 'loop'}).encode()
+                                   + b'\n\ndata: [DONE]\n\n')
+                            return
                 except GeneratorExit:
                     # Browser aborted (harness Stop button or iframe unloaded):
                     # free the accelerator instead of letting generation run out.
@@ -2296,7 +2354,8 @@ class AppContext:
             if model not in turn['models']:
                 return jsonify({'error': 'That model is not part of this comparison.'}), 400
             return _relay_chat_completion(_build_chat_payload(
-                turn['messages'], model, genai_app.get_config(), turn['gen_params']))
+                turn['messages'], model, genai_app.get_config(), turn['gen_params']),
+                stop_loops=True)
 
         @self.app.route('/compare/choose', methods=['POST'])
         def compare_choose():
@@ -3282,13 +3341,32 @@ def _apply_no_think(messages):
     return out
 
 
-def _answer_part(raw):
+def _sse_delta_text(line):
+    """The content delta in one ``data: {...}`` line of a chat completion
+    stream, or '' for anything else."""
+    line = line.strip()
+    if not line.startswith(b'data:'):
+        return ''
+    try:
+        choices = json.loads(line[5:]).get('choices') or []
+        return (choices[0].get('delta') or {}).get('content') or '' if choices else ''
+    except (ValueError, AttributeError, IndexError, TypeError):
+        return ''
+
+
+def _answer_part(raw, opens_thinking=False):
     """The portion of a streamed reply outside <think>…</think> — i.e. what should
-    be spoken (reasoning is never sent to TTS)."""
+    be spoken (reasoning is never sent to TTS).
+
+    ``opens_thinking``: the model's prompt already opened <think> (see
+    AppContext.model_opens_thinking), so everything before </think> is
+    reasoning, including a reply that has not reached </think> yet."""
     open_i = raw.find('<think>')
     if open_i == -1:
         close_i = raw.find('</think>')          # template pre-filled <think>
-        return raw[close_i + 8:] if close_i != -1 else raw
+        if close_i != -1:
+            return raw[close_i + 8:]
+        return '' if opens_thinking else raw
     pre = raw[:open_i]
     after = raw[open_i + 7:]
     close_i = after.find('</think>')
@@ -3386,9 +3464,12 @@ def stream_chat_request(messages, model, config, generation_id, socketio_event='
     payload = _build_chat_payload(messages, model, config, gen_params)
     _full_reply = ""   # accumulated content, to keep reasoning out of TTS
     _tts_spoken = 0    # length of the answer already sent to TTS
+    opens_thinking = genai_app.model_opens_thinking(
+        model, bool((gen_params or {}).get('no_think')))
+    loop = LoopDetector()
 
     try:
-        if not genai_app.start_assistant_response(generation_id):
+        if not genai_app.start_assistant_response(generation_id, opens_thinking):
             return None
         
         with requests.post(url, json=payload, stream=True) as resp:
@@ -3426,11 +3507,20 @@ def stream_chat_request(messages, model, config, generation_id, socketio_event='
                                         break
                                     # Update UI (the client splits <think> itself)
                                     genai_app.emit(socketio_event, {"results": content})
+                                    # The runtime decodes greedily, and a small
+                                    # reasoning model can repeat one passage
+                                    # until the token limit: stop it there.
+                                    if loop.feed(content):
+                                        logging.info(f"Stopping {model}: the reply is repeating itself")
+                                        post_stop_to_sima(model)
+                                        genai_app.cut_looped_response(generation_id, loop.keep)
+                                        genai_app.emit('loop_stopped', {"keep": loop.keep})
+                                        break
 
                                     # Trigger TTS on the ANSWER only — never speak
                                     # the model's <think> reasoning aloud.
                                     _full_reply += content
-                                    answer_so_far = _answer_part(_full_reply)
+                                    answer_so_far = _answer_part(_full_reply, opens_thinking)
                                     # A </think> can retroactively move earlier text
                                     # into reasoning, shrinking the answer — reset so
                                     # the real answer still gets spoken.

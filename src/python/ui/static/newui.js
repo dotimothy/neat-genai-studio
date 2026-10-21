@@ -98,6 +98,9 @@ let _residentOrder = [];
 let _mlaMemory = null;
 // The model the last chat request was sent to, for the per-reply model tag.
 let _lastRequestModel = '';
+// Whether the reply to the last request starts inside an unopened <think>
+// block (see modelOpensThinking); copied onto its message at the first token.
+let _lastRequestOpensThinking = false;
 const ACTIVE_MODEL_KEY = 'studioActiveChatModel';
 // Match the original Multimodal Assistant behavior: automatically enable image
 // prompting whenever a vision-capable model becomes active.
@@ -112,6 +115,15 @@ function getSelectedChatModel() {
   if (select) return select.value || '';
   const models = getConfiguredChatModels();
   return window.SIMA_CONFIG?.defaultChatModel || models[0] || '';
+}
+
+// Whether `model`'s chat template already opens <think> in the generation
+// prompt (DeepSeek-R1). Such a model streams its reasoning with no opening tag
+// and only emits </think>, so the reply must be shown as thinking from its first
+// token. The catalog reports it with thinking on and off.
+function modelOpensThinking(model, thinkingEnabled) {
+  const caps = getChatModelCapabilities()[model] || {};
+  return !!(thinkingEnabled ? caps.opensThinking : caps.opensThinkingWhenOff);
 }
 
 function selectedChatModelSupportsVision() {
@@ -173,6 +185,7 @@ function updateSelectedModelVisionState() {
   }
 
   if (activatedVisionModel) revealCameraForVisionModel();
+  applyMaxTokensRange();
 
   if (!supportsVision) {
     if (mediaStream) {
@@ -1688,6 +1701,7 @@ async function startProcessingInternal(resultMessage, textchat = null, waitForTr
   formData.append('searchRag', isRagEnabled() && searchRag ? searchRag.checked : false);
   formData.append('includeChatHistory', includeChatHistory ? includeChatHistory.checked : true);
   _lastRequestModel = getSelectedChatModel();
+  _lastRequestOpensThinking = modelOpensThinking(_lastRequestModel, getThinkingEnabled());
   formData.append('chatModel', _lastRequestModel);
   formData.append('utteranceSpeed', getUtteranceSpeed().toFixed(2));
   // Compare mode: name every loaded model. Answers are shown, not spoken.
@@ -2309,6 +2323,7 @@ function handleTextUpdate(data) {
         console.log('🔧 Restructured message with separate text container');
       }
       currentAssistantMessage.classList.add('speaking');
+      currentAssistantMessage._opensThinking = _lastRequestOpensThinking;
     }
 
     // Split the reply into reasoning (<think>…</think>) and the answer. Reasoning
@@ -2317,15 +2332,17 @@ function handleTextUpdate(data) {
     const msg = currentAssistantMessage;
     const answerEl = msg.querySelector('.message-text') || msg;
     msg._fullRaw = (msg._fullRaw || '') + cleanText;
-    const parts = splitThinking(msg._fullRaw);
+    const parts = splitThinking(msg._fullRaw, msg._opensThinking);
 
-    // The template-injected case (a </think> with no opening <think>) can only be
-    // recognized once </think> arrives — deltas before it were tentatively counted
-    // as output. On that transition, reclassify them as thinking so the counts and
-    // the block's token badge are right (safe: a plain answer never emits </think>).
+    // A model whose template opens <think> is known from the catalog, and its
+    // reply is thinking from the first token. Otherwise a </think> with no
+    // opening <think> can only be recognized when it arrives — deltas before it
+    // were tentatively counted as output. On that transition, reclassify them as
+    // thinking so the counts and the block's token badge are right (safe: a
+    // plain answer never emits </think>).
     if (parts.present && !msg._wasPresent) {
       msg._wasPresent = true;
-      if (msg._fullRaw.indexOf('<think>') === -1) {
+      if (msg._fullRaw.indexOf('<think>') === -1 && !msg._opensThinking) {
         msg._thinkTokens = (msg._thinkTokens || 0) + (msg._outTokens || 0);
         msg._outTokens = 0;
       }
@@ -2448,6 +2465,21 @@ socket.on('generation_error', (data) => {
   const message = (data && data.message) || 'Response generation failed. Please try again.';
   addChatMessage(`⚠️ ${message}`, false, false);
 });
+// The server stopped the reply because it was repeating one passage (the
+// runtime decodes greedily, and small reasoning models can loop that way).
+// 'end' follows; it explains the stop on the message.
+socket.on('loop_stopped', () => {
+  const msgs = chatMessages.querySelectorAll('.message.assistant');
+  const msg = msgs[msgs.length - 1];
+  if (msg) msg._looped = true;
+});
+
+const LOOP_NOTE_THINKING = 'Stopped: the reasoning kept repeating the same passage, so it never '
+  + 'reached an answer. The board picks the likeliest next word every time (it cannot sample '
+  + 'with a temperature), and small reasoning models can get stuck that way. Try asking again '
+  + 'in different words.';
+const LOOP_NOTE_ANSWER = 'Stopped: the reply kept repeating the same passage.';
+
 socket.on('end', (data) => {
   console.log('Received end event:', data);
   receivedEndSignal = true;
@@ -2478,6 +2510,29 @@ socket.on('end', (data) => {
       cancelPendingRender(tb._thinkText);
       renderMarkdownStreaming(tb._thinkText, tb._thinkText._raw || tb._thinkText.textContent);
       enhanceCodeBlocks(tb._thinkText);
+      // The reply ended inside its reasoning (the token limit or Stop), so
+      // there is no answer. Say so rather than leaving an empty reply.
+      const parts = splitThinking(currentAssistantMessage._fullRaw, currentAssistantMessage._opensThinking);
+      if (!parts.closed && !parts.answer.trim() && textContainer) {
+        textContainer.innerHTML = '';
+        const note = document.createElement('span');
+        note.className = 'think-unfinished';
+        note.textContent = currentAssistantMessage._looped ? LOOP_NOTE_THINKING
+          : getMaxTokens() >= modelContextLength(_lastRequestModel)
+          ? 'Stopped while still thinking, before an answer: the reasoning filled the model\'s '
+            + modelContextLength(_lastRequestModel) + '-token context.'
+          : 'Stopped while still thinking, before an answer. Reasoning models '
+            + 'can need more than ' + getMaxTokens() + ' tokens: raise Max response tokens in Settings.';
+        textContainer.appendChild(note);
+      }
+    }
+    // A loop in the answer itself: keep the answer, say why it ends there.
+    if (currentAssistantMessage._looped && textContainer
+        && !textContainer.querySelector('.think-unfinished')) {
+      const note = document.createElement('div');
+      note.className = 'think-unfinished';
+      note.textContent = LOOP_NOTE_ANSWER;
+      textContainer.appendChild(note);
     }
     addResponseCopyButton(currentAssistantMessage);   // copy the whole reply
 
@@ -3807,8 +3862,10 @@ function setMarkdownThrottled(container, fullText) {
 // ---- Thinking (reasoning) rendering ------------------------------------------
 // Reasoning models stream their chain-of-thought inline as <think>…</think>
 // before the answer. Split it out so the thinking shows in a collapsible block
-// above the answer, and the two are counted separately.
-function splitThinking(raw) {
+// above the answer, and the two are counted separately. `opensThinking`: the
+// model's prompt already opened <think> (modelOpensThinking), so a reply with
+// no tags yet is reasoning still in progress, not an answer.
+function splitThinking(raw, opensThinking) {
   raw = raw || '';
   const openIdx = raw.indexOf('<think>');
   if (openIdx !== -1) {                       // explicit <think>…</think>
@@ -3822,6 +3879,7 @@ function splitThinking(raw) {
   if (closeIdx !== -1) {
     return { thinking: raw.slice(0, closeIdx), answer: raw.slice(closeIdx + 8), present: true, closed: true };
   }
+  if (opensThinking) return { thinking: raw, answer: '', present: true, closed: false };
   return { thinking: '', answer: raw, present: false, closed: true };
 }
 
@@ -4052,7 +4110,11 @@ async function refreshCatalog() {
     const caps = window.SIMA_CONFIG.chatModelCapabilities || {};
     catalog.forEach(m => {
       if (m.type !== 'asr') {
-        caps[m.name] = { supportsVision: !!m.supportsVision, imageSize: m.imageSize || null };
+        caps[m.name] = {
+          supportsVision: !!m.supportsVision, imageSize: m.imageSize || null,
+          opensThinking: !!m.opensThinking, opensThinkingWhenOff: !!m.opensThinkingWhenOff,
+          contextLength: m.contextLength || null,
+        };
       }
     });
     window.SIMA_CONFIG.chatModelCapabilities = caps;
@@ -5404,7 +5466,7 @@ function renderCardMeta(d) {
   if (d.imageSize && d.imageSize.width) add('Image size', `${d.imageSize.width}×${d.imageSize.height}`);
   const cfg = d.config || {};
   if (cfg.model_type) add('Architecture', esc(cfg.model_type));
-  const ctx = cfg.max_seq_len || cfg.context_length || cfg.max_position_embeddings;
+  const ctx = d.contextLength || cfg.max_seq_len || cfg.context_length || cfg.max_position_embeddings;
   if (ctx) add('Context length', esc(ctx));
   if (d.downloads != null) add('Downloads', Number(d.downloads).toLocaleString());
   if (d.likes != null) add('Likes', Number(d.likes).toLocaleString());
@@ -6235,9 +6297,46 @@ function initTtsToggle() {
 
 // ---- Generation settings (max response tokens) ------------------------
 
+// Max response tokens tops out at the selected model's compiled context
+// (prompt plus reply, e.g. 8192) and defaults to all of it. The runtime ends a
+// reply at the end of the context, so the full context means "no extra limit".
+// The preference is a number or 'ctx' (whole context, whatever the model);
+// it follows the model when the selection changes.
+const MAX_TOKENS_PREF_KEY = 'studioMaxTokensPref';
+const DEFAULT_CONTEXT_TOKENS = 8192;
+
+function modelContextLength(model) {
+  const n = parseInt((getChatModelCapabilities()[model] || {}).contextLength, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_CONTEXT_TOKENS;
+}
+
+function readMaxTokensPref() {
+  try {
+    const saved = localStorage.getItem(MAX_TOKENS_PREF_KEY);
+    if (saved === 'ctx') return 'ctx';
+    const n = parseInt(saved, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch (e) { /* ignore */ }
+  const cfgDefault = parseInt(window.SIMA_CONFIG?.defaultMaxTokens, 10);
+  return Number.isFinite(cfgDefault) && cfgDefault > 0 ? cfgDefault : 'ctx';
+}
+
+// Fit the slider to the selected model's context and show the preference on it.
+function applyMaxTokensRange() {
+  const range = document.getElementById('maxTokensRange');
+  const value = document.getElementById('maxTokensValue');
+  if (!range) return;
+  const ctx = modelContextLength(getSelectedChatModel());
+  const pref = readMaxTokensPref();
+  range.max = String(ctx);
+  range.value = String(pref === 'ctx' ? ctx : Math.min(pref, ctx));
+  const n = parseInt(range.value, 10);
+  if (value) value.textContent = n >= ctx ? `${n} (full context)` : String(n);
+}
+
 function getMaxTokens() {
   const el = document.getElementById('maxTokensRange');
-  return el ? parseInt(el.value, 10) : 512;
+  return el ? parseInt(el.value, 10) : DEFAULT_CONTEXT_TOKENS;
 }
 
 // Whether reasoning models should think. On by default; when off we ask the
@@ -6261,15 +6360,13 @@ function initGenerationControls() {
     });
   }
   if (!range) return;
-  const cfgDefault = parseInt(window.SIMA_CONFIG?.defaultMaxTokens, 10);
-  const saved = parseInt(localStorage.getItem('studioMaxTokens'), 10);
-  if (Number.isFinite(saved)) range.value = saved;
-  else if (Number.isFinite(cfgDefault)) range.value = cfgDefault;
-  const sync = () => { if (value) value.textContent = range.value; };
-  sync();
+  applyMaxTokensRange();
   range.addEventListener('input', () => {
-    sync();
-    localStorage.setItem('studioMaxTokens', range.value);
+    const atMax = parseInt(range.value, 10) >= parseInt(range.max, 10);
+    try {
+      localStorage.setItem(MAX_TOKENS_PREF_KEY, atMax ? 'ctx' : range.value);
+    } catch (e) { /* ignore */ }
+    applyMaxTokensRange();
   });
 }
 
@@ -7281,6 +7378,7 @@ function buildCompareBlock(info) {
     grid.appendChild(col);
     return {
       model, col, text: '', tokens: 0, tps: null, ttftS: null, totalS: null,
+      opensThinking: modelOpensThinking(model, getThinkingEnabled()),
       bodyEl: col.querySelector('.compare-col-body'),
       statsEl: col.querySelector('.compare-col-stats'),
       stateEl: col.querySelector('.compare-col-state'),
@@ -7312,7 +7410,7 @@ async function compareStreamOne(ctx, c, t0) {
     // Cancel a pending throttled render first, or it fires next frame and
     // re-renders without the highlighting / copy buttons.
     cancelPendingRender(c.bodyEl);
-    renderMarkdownInto(c.bodyEl, splitThinking(c.text).answer);
+    renderMarkdownInto(c.bodyEl, splitThinking(c.text, c.opensThinking).answer);
     c.col.classList.remove('is-running');
   };
   compareSetState(c, 'Waiting for the first token…', 'busy');
@@ -7348,6 +7446,7 @@ async function compareStreamOne(ctx, c, t0) {
         let obj;
         try { obj = JSON.parse(data); } catch (e) { continue; }
         if (obj.error) throw new Error(String(obj.error.message || obj.error));
+        if (obj.studio_stopped === 'loop') { c.looped = true; c.stopped = true; continue; }
         if (obj.tps != null && Number.isFinite(Number(obj.tps))) srvTps = Number(obj.tps);
         const delta = obj.choices && obj.choices[0] && obj.choices[0].delta && obj.choices[0].delta.content;
         if (!delta) continue;
@@ -7356,14 +7455,15 @@ async function compareStreamOne(ctx, c, t0) {
         tLast = now;
         c.tokens += 1;
         c.text += delta;
-        const parts = splitThinking(c.text);
+        const parts = splitThinking(c.text, c.opensThinking);
         compareSetState(c, parts.present && !parts.closed ? 'Thinking…' : 'Generating…', 'busy');
         if (srvTps != null) c.tps = srvTps;
         c.statsEl.textContent = compareStatsText(c);
         setMarkdownThrottled(c.bodyEl, parts.answer);
       }
     }
-    settle(c.tokens ? '' : 'No output', c.tokens ? '' : 'error');
+    if (c.looped) settle('Stopped: it kept repeating the same passage', 'muted');
+    else settle(c.tokens ? '' : 'No output', c.tokens ? '' : 'error');
   } catch (err) {
     if (err && err.name === 'AbortError') { c.stopped = true; settle('Stopped', 'muted'); }
     else settle(`Failed: ${err && err.message ? err.message : err}`, 'error');

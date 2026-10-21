@@ -23,12 +23,12 @@ from shared.config import HubConfig
 class HubPathSecurityTests(unittest.TestCase):
     def setUp(self):
         self.hub = HubConfig(allow_download=True,
-                             orgs=("simaai", "TDoSiMa", "florianvoss"))
+                             orgs=("dotimothy", "simaai", "florianvoss"))
 
     def test_accepts_existing_model_id_shapes(self):
         values = (
             "simaai/Qwen2.5-VL-7B-Instruct-GPTQ-a16w4",
-            "TDoSiMa/gemma-4-E4B-it_GPTQ_INT4-emb-int8-8k",
+            "dotimothy/DeepSeek-R1-Distill-Qwen-1.5B-GPTQ-a16w4",
             "florianvoss/whisper-large-v3-turbo-a16w8-layered-encoder",
         )
         for value in values:
@@ -45,7 +45,7 @@ class HubPathSecurityTests(unittest.TestCase):
         """
         from shared.config import _load_hub_config
         self.assertEqual(_load_hub_config({}).orgs,
-                         ("simaai", "TDoSiMa", "florianvoss"))
+                         ("dotimothy", "simaai", "florianvoss"))
 
     def test_community_whisper_repos_are_typed_as_asr(self):
         for name in ("whisper-small-a16w8-layered-encoder",

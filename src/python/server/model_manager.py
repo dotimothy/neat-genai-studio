@@ -31,7 +31,7 @@ import urllib.request
 import wave
 from pathlib import Path
 
-from shared.chat_template import repair_chat_template_files
+from shared.chat_template import generation_opens_thinking, repair_chat_template_files
 from shared.config import (HubConfig, classify_model_dir, model_dir_complete,
                            model_dir_supported)
 
@@ -203,6 +203,29 @@ def dispatcher_identity() -> tuple[int, int] | None:
         return pid, 0
 
 
+# The dispatcher's control socket. Every connected client shows up in
+# /proc/net/unix as one connected (state 03) socket under this path, readable
+# without privileges.
+_MLA_CTRL_SOCKET = "/tmp/mlactrl"
+
+
+def dispatcher_client_count(path: str = _MLA_CTRL_SOCKET,
+                            table: str = "/proc/net/unix") -> int | None:
+    """How many programs are connected to the MLA dispatcher, or None when
+    that cannot be read."""
+    try:
+        with open(table, encoding="utf-8") as fh:
+            rows = fh.read().splitlines()[1:]
+    except OSError:
+        return None
+    count = 0
+    for row in rows:
+        parts = row.split()
+        if len(parts) >= 8 and parts[7] == path and parts[5] == "03":
+            count += 1
+    return count
+
+
 def read_dispatcher_maps() -> str | None:
     """The dispatcher's memory map, or None when it cannot be read.
 
@@ -271,6 +294,7 @@ class ModelManager:
         asr_warmup: bool = True,
         mla_reset_exit_code: int = 75,
         mla_reset_enabled: bool = True,
+        reclaim_memory: bool = False,
         switch_settle_s: float = 0.6,
         log_tap=None,
     ) -> None:
@@ -294,6 +318,9 @@ class ModelManager:
         # dispatcher and relaunch. Only ever used for an explicit user request.
         self._mla_reset_exit_code = int(mla_reset_exit_code)
         self._mla_reset_enabled = bool(mla_reset_enabled)
+        # Give unloaded models' accelerator memory back (see _reclaim_memory).
+        self._reclaim = bool(reclaim_memory)
+        self._reclaim_last: dict | None = None
         # After unloading the outgoing model, wait briefly so its RAII free
         # (which returns MLA memory to the dispatcher) completes before loading
         # the replacement — avoids transient double-residency (MLA_LOAD_FAILED).
@@ -317,6 +344,10 @@ class ModelManager:
         self._size_cache: dict[str, int] = {}
         # Weight-completeness per model dir (cached; cleared on each rescan).
         self._complete_cache: dict = {}
+        # Whether each model's chat template opens <think> in the generation
+        # prompt, with thinking on and off (cached; cleared on each rescan).
+        self._opens_thinking_cache: dict[str, tuple[bool, bool]] = {}
+        self._context_cache: dict[str, int | None] = {}
         # Live load progress (for the UI) — the MLA gives no true progress signal,
         # so we expose elapsed time + a learned ETA from weight size / past loads.
         self._loading: dict | None = None
@@ -363,6 +394,8 @@ class ModelManager:
     def scan_catalog(self) -> list[dict]:
         """Rescan ``catalog_dir`` for compatible models and refresh the index."""
         self._complete_cache = {}   # re-check completeness on an explicit rescan
+        self._opens_thinking_cache = {}
+        self._context_cache = {}
         catalog: dict[str, dict] = {}
         if self._catalog_dir and self._catalog_dir.is_dir():
             for child in sorted(self._catalog_dir.iterdir()):
@@ -411,6 +444,37 @@ class ModelManager:
         self._size_cache[key] = total
         return total
 
+    def _opens_thinking(self, path) -> tuple[bool, bool]:
+        """(with thinking on, with it off): whether the model's generation
+        prompt already opens a <think> block, so its reply starts inside the
+        reasoning and only </think> is streamed (DeepSeek-R1). Cached per dir."""
+        if not path:
+            return False, False
+        key = str(path)
+        cached = self._opens_thinking_cache.get(key)
+        if cached is None:
+            cached = (generation_opens_thinking(path), generation_opens_thinking(path, False))
+            self._opens_thinking_cache[key] = cached
+        return cached
+
+    def _context_length(self, path) -> int | None:
+        """Tokens the compiled pipeline holds, prompt plus reply
+        (vlm_config.json pipeline_cfg.max_num_tokens, set by llima-compile
+        --max_num_tokens). None when unknown. Cached per dir."""
+        if not path:
+            return None
+        key = str(path)
+        if key not in self._context_cache:
+            value = None
+            try:
+                raw = json.loads((Path(path) / "devkit" / "vlm_config.json").read_text(encoding="utf-8"))
+                n = int((raw.get("pipeline_cfg") or {}).get("max_num_tokens") or 0)
+                value = n if n > 0 else None
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+            self._context_cache[key] = value
+        return self._context_cache[key]
+
     def _is_model_complete(self, path) -> tuple[bool, str]:
         """Cached weight-completeness check for a model dir (cleared on rescan)."""
         key = str(path) if path else ""
@@ -436,6 +500,11 @@ class ModelManager:
                 "type": info.get("type", "chat"),
                 "supportsVision": bool(info.get("supports_vision")),
                 "imageSize": info.get("image_size"),
+                # The reply starts inside <think> (template-opened reasoning);
+                # "WhenOff" is with chat_template_kwargs enable_thinking=False.
+                "opensThinking": self._opens_thinking(path)[0],
+                "opensThinkingWhenOff": self._opens_thinking(path)[1],
+                "contextLength": self._context_length(path),
                 "loaded": info["name"] in loaded,
                 # "pinned" = the ASR model config re-selects on restart;
                 # "activeAsr" = the one serving transcriptions right now.
@@ -544,6 +613,10 @@ class ModelManager:
                 "maxResidentLimit": MAX_RESIDENT_LIMIT,
                 "lost": list(self._lost),
                 "verifying": self._verifying,
+                "reclaim": {
+                    "enabled": self._reclaim,
+                    "last": dict(self._reclaim_last) if self._reclaim_last else None,
+                },
             }
         state["mla"] = self.mla_memory()
         return state
@@ -727,6 +800,8 @@ class ModelManager:
                 with self._lock:
                     if victim in self._resident:
                         self._resident.remove(victim)
+            if evicted:
+                self._reclaim_memory(f"lowering the resident limit to {limit}")
         return dict(self.residency(), evicted=evicted)
 
     # -- load / unload ---------------------------------------------------------
@@ -744,270 +819,279 @@ class ModelManager:
         """
         name = (name or "").strip()
         with self._op_lock:
-            if name not in self._catalog:
-                self.scan_catalog()
-            with self._lock:
-                info = self._catalog.get(name)
-                if info is None:
-                    raise ValueError(f"Unknown model: {name}")
-                path = info.get("path")
-                is_asr = info.get("type") == "asr"
+            return self._load_locked(name)
 
-            if name in self._server_model_names():
-                if not is_asr:
-                    self.touch(name)
-                    return {"name": name, "state": "ready", "evicted": [],
-                            "cold_start": False, "load_seconds": 0.0}
-                # An ASR model can be registered yet NOT active: a warm-up that
-                # failed leaves the registration behind when remove_model also
-                # fails. Declaring it active on that basis would report ready
-                # without ever re-checking, and the next transcription would fail
-                # the same way — so prove it works before adopting it.
-                if self._active_asr == name or not (self._warmup and self._asr_warmup):
-                    with self._lock:
-                        self._active_asr = name
-                    return {"name": name, "state": "ready", "evicted": [],
-                            "cold_start": False, "load_seconds": 0.0}
-                probe_started = time.monotonic()
-                self._log_note(f"Re-checking {name} (already registered)…")
-                ok, detail = self._warm_check_asr(name)
-                if not ok and (_is_mla_failure(detail) or self._is_probe_timeout(detail)):
-                    with self._lock:
-                        self._active_asr = None
-                    return self._handle_mla_failure(name, detail)
-                if not ok and not self._is_probe_client_error(detail):
-                    # Same rule as a fresh load: a server or transport failure
-                    # proved nothing, so do not adopt a model that never answered.
-                    with self._lock:
-                        self._active_asr = None
-                    return self._handle_warm_failure(name, detail)
+    def _load_locked(self, name: str, reclaim: bool = True) -> dict:
+        """``load`` for a caller already holding ``_op_lock``. ``reclaim``:
+        give an evicted model's accelerator memory back (_reclaim_memory);
+        off when that is what is loading the models back."""
+        if name not in self._catalog:
+            self.scan_catalog()
+        with self._lock:
+            info = self._catalog.get(name)
+            if info is None:
+                raise ValueError(f"Unknown model: {name}")
+            path = info.get("path")
+            is_asr = info.get("type") == "asr"
+
+        if name in self._server_model_names():
+            if not is_asr:
+                self.touch(name)
+                return {"name": name, "state": "ready", "evicted": [],
+                        "cold_start": False, "load_seconds": 0.0}
+            # An ASR model can be registered yet NOT active: a warm-up that
+            # failed leaves the registration behind when remove_model also
+            # fails. Declaring it active on that basis would report ready
+            # without ever re-checking, and the next transcription would fail
+            # the same way — so prove it works before adopting it.
+            if self._active_asr == name or not (self._warmup and self._asr_warmup):
                 with self._lock:
                     self._active_asr = name
-                result = {"name": name, "state": "ready", "evicted": [],
-                          "cold_start": False,
-                          "load_seconds": round(time.monotonic() - probe_started, 1)}
-                if not ok:
-                    logging.warning("ASR re-check for '%s' did not complete: %s",
-                                    name, detail)
-                    result["warm_warning"] = detail[:500]
-                return result
-
-            if not path or not Path(path).is_dir():
-                raise ValueError(f"Model directory not found for: {name}")
-
-            # Refuse to load a model whose weights are missing/partial — otherwise
-            # it fails deep in the MLA with a confusing error.
-            complete, reason = self._is_model_complete(path)
-            ok_supported, why_unsupported = model_dir_supported(path)
-            if not ok_supported:
-                raise ValueError(f"'{name}' cannot be loaded — {why_unsupported}")
-            if not complete:
-                raise ValueError(
-                    f"'{name}' cannot be loaded — {reason}. Re-download it from Add Model."
-                )
-
-            # Self-heal chat-template files (corrupt HTML pages, new root-level
-            # Hub layout) before the runtime's minja parser ever sees them —
-            # this also fixes models downloaded before the repair existed.
-            try:
-                for fix in repair_chat_template_files(path):
-                    logging.info("model '%s': %s", name, fix)
-            except Exception:  # noqa: BLE001 - repair is best-effort
-                pass
-
-            # ASR models have their own slot: switching evicts the previous ASR
-            # and leaves the resident chat/VLM model alone (and vice versa).
-            if is_asr:
-                victims = [v for v in self._loaded_asr_names() if v != name]
-            else:
-                # Keep the most recently used models that still fit beside the
-                # new one; everything older is evicted to make room.
-                self._sync_resident_from_server()
+                return {"name": name, "state": "ready", "evicted": [],
+                        "cold_start": False, "load_seconds": 0.0}
+            probe_started = time.monotonic()
+            self._log_note(f"Re-checking {name} (already registered)…")
+            ok, detail = self._warm_check_asr(name)
+            if not ok and (_is_mla_failure(detail) or self._is_probe_timeout(detail)):
                 with self._lock:
-                    others = [v for v in self._resident if v != name]
-                    victims = others[max(0, self._max_resident - 1):]
+                    self._active_asr = None
+                return self._handle_mla_failure(name, detail)
+            if not ok and not self._is_probe_client_error(detail):
+                # Same rule as a fresh load: a server or transport failure
+                # proved nothing, so do not adopt a model that never answered.
+                with self._lock:
+                    self._active_asr = None
+                return self._handle_warm_failure(name, detail)
+            with self._lock:
+                self._active_asr = name
+            result = {"name": name, "state": "ready", "evicted": [],
+                      "cold_start": False,
+                      "load_seconds": round(time.monotonic() - probe_started, 1)}
+            if not ok:
+                logging.warning("ASR re-check for '%s' did not complete: %s",
+                                name, detail)
+                result["warm_warning"] = detail[:500]
+            return result
 
-            size_bytes = self._size_of(path)
-            # Estimate and learn against the ELF bytes actually transferred, so
-            # the rate stays comparable across models whose directories carry
-            # very different amounts of non-ELF baggage.
-            load_bytes = self._elf_bytes(path) or size_bytes
-            started = time.monotonic()
-            self._last_error = None
-            self._loading = {
-                "name": name,
-                "phase": "loading",
-                "victim": None,
-                "startedAt": started,
-                "estTotalS": self._estimate_load_seconds(name, load_bytes),
-                # Real progress: count completed ELF-stage loads (from the
-                # stdout tap) minus the baseline against the on-disk total.
-                "elfTotal": self._count_elf_stages(path),
-                "elfBase": self._log_tap.loaded_count if self._log_tap else 0,
-            }
-            evicted: list = []
-            stages = self._loading.get("elfTotal")
-            self._log_note(
-                f"Loading {name} — {self._fmt_size(size_bytes)}"
-                + (f", {stages} stages" if stages else "")
-                + (f", est {self._loading['estTotalS']:.0f}s" if self._loading.get("estTotalS") else "")
+        if not path or not Path(path).is_dir():
+            raise ValueError(f"Model directory not found for: {name}")
+
+        # Refuse to load a model whose weights are missing/partial — otherwise
+        # it fails deep in the MLA with a confusing error.
+        complete, reason = self._is_model_complete(path)
+        ok_supported, why_unsupported = model_dir_supported(path)
+        if not ok_supported:
+            raise ValueError(f"'{name}' cannot be loaded — {why_unsupported}")
+        if not complete:
+            raise ValueError(
+                f"'{name}' cannot be loaded — {reason}. Re-download it from Add Model."
             )
-            try:
-                # Evict what no longer fits. _stop_model_streams (an HTTP
-                # /stop) and remove_model (which triggers the outgoing model's RAII
-                # free of MLA memory) can each block for seconds — do them WITHOUT
-                # holding _lock so status polls stay responsive during the switch.
-                for victim in victims:
-                    self._log_note(f"Unloading {victim}")
-                    # Say what the wait is for, for clients that can reach us.
-                    self._loading.update(phase="unloading", victim=victim)
-                    try:
-                        # remove_model reports a model it did not remove by
-                        # returning False rather than raising; treat that the
-                        # same way unload() does — as authoritative.
-                        if not self._unload_timed(victim):
-                            raise RuntimeError("the runtime reported it was not removed")
-                        evicted.append(victim)
-                        with self._lock:
-                            if victim in self._resident:
-                                self._resident.remove(victim)
-                    except Exception as exc:
-                        # Whichever slot: if the outgoing model will not free,
-                        # adding the replacement leaves more resident than the
-                        # limit allows (which can fail the load outright) and
-                        # the state below would drop the old one from
-                        # `_resident` / `_active_asr`, making it invisible to
-                        # every later eviction. Abort, keeping it tracked.
-                        kind = "speech-to-text" if is_asr else "chat"
-                        raise RuntimeError(
-                            f"Could not unload the current {kind} model "
-                            f"'{victim}': {exc}"
-                        ) from exc
-                if is_asr:
-                    with self._lock:
-                        # Honest during the eviction window: nothing can serve a
-                        # transcription until the replacement is registered.
-                        self._active_asr = None
-                # Let the free complete before loading the replacement, so an
-                # evicted model and the new one are never briefly co-resident.
-                if evicted and self._switch_settle_s:
-                    time.sleep(self._switch_settle_s)
 
-                self._loading.update(phase="loading", victim=None)
-                if name in self._gone:
-                    # A stale registration from before an outside reset: clear
-                    # it so the model can be registered afresh.
-                    try:
-                        self._server.remove_model(name)
-                    except Exception:  # noqa: BLE001 - best effort
-                        pass
-                    self._gone.discard(name)
-                # Whatever is loaded from here on lives in the dispatcher that
-                # is running now.
-                self._dispatcher_seen = dispatcher_identity() or self._dispatcher_seen
-                # add_model returns the name the server actually served it under,
-                # which may differ from the requested one — that is the truth.
-                self._log_note(f"Registering {name} with the runtime…")
+        # Self-heal chat-template files (corrupt HTML pages, new root-level
+        # Hub layout) before the runtime's minja parser ever sees them —
+        # this also fixes models downloaded before the repair existed.
+        try:
+            for fix in repair_chat_template_files(path):
+                logging.info("model '%s': %s", name, fix)
+        except Exception:  # noqa: BLE001 - repair is best-effort
+            pass
+
+        # ASR models have their own slot: switching evicts the previous ASR
+        # and leaves the resident chat/VLM model alone (and vice versa).
+        if is_asr:
+            victims = [v for v in self._loaded_asr_names() if v != name]
+        else:
+            # Keep the most recently used models that still fit beside the
+            # new one; everything older is evicted to make room.
+            self._sync_resident_from_server()
+            with self._lock:
+                others = [v for v in self._resident if v != name]
+                victims = others[max(0, self._max_resident - 1):]
+
+        size_bytes = self._size_of(path)
+        # Estimate and learn against the ELF bytes actually transferred, so
+        # the rate stays comparable across models whose directories carry
+        # very different amounts of non-ELF baggage.
+        load_bytes = self._elf_bytes(path) or size_bytes
+        started = time.monotonic()
+        self._last_error = None
+        self._loading = {
+            "name": name,
+            "phase": "loading",
+            "victim": None,
+            "startedAt": started,
+            "estTotalS": self._estimate_load_seconds(name, load_bytes),
+            # Real progress: count completed ELF-stage loads (from the
+            # stdout tap) minus the baseline against the on-disk total.
+            "elfTotal": self._count_elf_stages(path),
+            "elfBase": self._log_tap.loaded_count if self._log_tap else 0,
+        }
+        evicted: list = []
+        stages = self._loading.get("elfTotal")
+        self._log_note(
+            f"Loading {name} — {self._fmt_size(size_bytes)}"
+            + (f", {stages} stages" if stages else "")
+            + (f", est {self._loading['estTotalS']:.0f}s" if self._loading.get("estTotalS") else "")
+        )
+        try:
+            # Evict what no longer fits. _stop_model_streams (an HTTP
+            # /stop) and remove_model (which triggers the outgoing model's RAII
+            # free of MLA memory) can each block for seconds — do them WITHOUT
+            # holding _lock so status polls stay responsive during the switch.
+            for victim in victims:
+                self._log_note(f"Unloading {victim}")
+                # Say what the wait is for, for clients that can reach us.
+                self._loading.update(phase="unloading", victim=victim)
                 try:
-                    served = self._server.add_model(str(path), name)
-                except Exception as exc:  # noqa: BLE001 - classified below
-                    # Current runtimes transfer the weights inside add_model,
-                    # so an accelerator failure surfaces here rather than at
-                    # the warm-up; give it the same rollback and guidance.
-                    if _is_mla_failure(str(exc)):
-                        if is_asr:
-                            with self._lock:
-                                self._active_asr = None
-                        return self._handle_mla_failure(name, str(exc))
-                    raise
-                self._log_note(
-                    f"Registered {served}; transferring weights to the accelerator…"
-                )
+                    # remove_model reports a model it did not remove by
+                    # returning False rather than raising; treat that the
+                    # same way unload() does — as authoritative.
+                    if not self._unload_timed(victim):
+                        raise RuntimeError("the runtime reported it was not removed")
+                    evicted.append(victim)
+                    with self._lock:
+                        if victim in self._resident:
+                            self._resident.remove(victim)
+                except Exception as exc:
+                    # Whichever slot: if the outgoing model will not free,
+                    # adding the replacement leaves more resident than the
+                    # limit allows (which can fail the load outright) and
+                    # the state below would drop the old one from
+                    # `_resident` / `_active_asr`, making it invisible to
+                    # every later eviction. Abort, keeping it tracked.
+                    kind = "speech-to-text" if is_asr else "chat"
+                    raise RuntimeError(
+                        f"Could not unload the current {kind} model "
+                        f"'{victim}': {exc}"
+                    ) from exc
+            if is_asr:
                 with self._lock:
-                    # The runtime may serve the model under a normalized name.
-                    # Every guard (active-ASR refusal, path resolution, catalog
-                    # loaded/active flags) is keyed by catalog name, so the
-                    # served name must be a catalog entry too, or a delete of
-                    # the requested name could rmtree the weights of a model
-                    # that is still registered and active.
-                    if served != name and served not in self._catalog:
-                        self._catalog[served] = dict(info, name=served)
-                    if is_asr:
-                        self._active_asr = served
-                    else:
-                        self._resident = [served] + [
-                            v for v in self._resident if v not in (served, name)
-                        ]
+                    # Honest during the eviction window: nothing can serve a
+                    # transcription until the replacement is registered.
+                    self._active_asr = None
+            # Let the free complete before loading the replacement, so an
+            # evicted model and the new one are never briefly co-resident.
+            if evicted and self._switch_settle_s:
+                time.sleep(self._switch_settle_s)
+            # ... which the dispatcher does only once it is idle.
+            if evicted and reclaim:
+                self._reclaim_memory(f"loading {name}")
 
-                # add_model only registers; the real MLA load is deferred to first
-                # inference. Warm synchronously so a load failure is catchable and
-                # so we can time the load (this is where the wait actually happens).
-                if is_asr:
-                    if not (self._warmup and self._asr_warmup):
-                        return {"name": served, "state": "ready", "evicted": evicted,
-                                "cold_start": True,
-                                "load_seconds": round(time.monotonic() - started, 1)}
-                    self._log_note("Warming up (first transcription forces the load)…")
-                    ok, detail = self._warm_check_asr(served)
-                    if ok:
-                        self._record_load_duration(name, load_bytes,
-                                                   time.monotonic() - started)
-                        self._log_note(f"Ready: {served} in {time.monotonic() - started:.1f}s")
-                        return {"name": served, "state": "ready", "evicted": evicted,
-                                "cold_start": True,
-                                "load_seconds": round(time.monotonic() - started, 1)}
-                    if _is_mla_failure(detail) or self._is_probe_timeout(detail):
-                        with self._lock:
-                            self._active_asr = None
-                        return self._handle_mla_failure(served, detail)
-                    if not self._is_probe_client_error(detail):
-                        # A server error or a transport failure (HTTP 5xx,
-                        # connection refused, ...) proved nothing about the
-                        # model either: no inference succeeded. Roll the switch
-                        # back rather than declare it ready.
-                        with self._lock:
-                            self._active_asr = None
-                        return self._handle_warm_failure(served, detail)
-                    # Soft failure: unlike the chat probe, this one depends on the
-                    # runtime's multipart handling and on how a given Whisper
-                    # artifact reacts to pure silence. A 4xx here most likely
-                    # means the probe's payload, not the model, was rejected, so
-                    # keep it active — it will load on first use, exactly as it
-                    # did before warming existed.
-                    logging.warning("ASR warm-up for '%s' did not complete: %s",
-                                    served, detail)
-                    return {"name": served, "state": "ready", "evicted": evicted,
-                            "cold_start": True,
-                            "load_seconds": round(time.monotonic() - started, 1),
-                            "warm_warning": detail[:500]}
-
-                if not self._warmup:
-                    return {"name": served, "state": "ready", "evicted": evicted,
-                            "cold_start": True, "load_seconds": round(time.monotonic() - started, 1)}
-
-                self._log_note("Warming up (first inference forces the load)…")
-                ok, detail = self._warm_check(name)
-                if ok:
-                    self._record_load_duration(name, load_bytes, time.monotonic() - started)
-                    self._log_note(f"Ready: {served} in {time.monotonic() - started:.1f}s")
-                    return {"name": served, "state": "ready", "evicted": evicted,
-                            "cold_start": True, "load_seconds": round(time.monotonic() - started, 1)}
-
-                if _is_mla_failure(detail):
-                    return self._handle_mla_failure(name, detail)
-
-                # Non-MLA warm failure: roll back so manager state stays consistent.
-                # Only the model that failed goes; the others are still resident.
+            self._loading.update(phase="loading", victim=None)
+            if name in self._gone:
+                # A stale registration from before an outside reset: clear
+                # it so the model can be registered afresh.
                 try:
                     self._server.remove_model(name)
-                except Exception:
+                except Exception:  # noqa: BLE001 - best effort
                     pass
-                with self._lock:
-                    self._resident = [v for v in self._resident if v != name]
-                self._record_error(name, detail, kind="load")
-                raise RuntimeError(f"Model '{name}' failed to load: {detail}")
-            finally:
-                self._loading = None
+                self._gone.discard(name)
+            # Whatever is loaded from here on lives in the dispatcher that
+            # is running now.
+            self._dispatcher_seen = dispatcher_identity() or self._dispatcher_seen
+            # add_model returns the name the server actually served it under,
+            # which may differ from the requested one — that is the truth.
+            self._log_note(f"Registering {name} with the runtime…")
+            try:
+                served = self._server.add_model(str(path), name)
+            except Exception as exc:  # noqa: BLE001 - classified below
+                # Current runtimes transfer the weights inside add_model,
+                # so an accelerator failure surfaces here rather than at
+                # the warm-up; give it the same rollback and guidance.
+                if _is_mla_failure(str(exc)):
+                    if is_asr:
+                        with self._lock:
+                            self._active_asr = None
+                    return self._handle_mla_failure(name, str(exc))
+                raise
+            self._log_note(
+                f"Registered {served}; transferring weights to the accelerator…"
+            )
+            with self._lock:
+                # The runtime may serve the model under a normalized name.
+                # Every guard (active-ASR refusal, path resolution, catalog
+                # loaded/active flags) is keyed by catalog name, so the
+                # served name must be a catalog entry too, or a delete of
+                # the requested name could rmtree the weights of a model
+                # that is still registered and active.
+                if served != name and served not in self._catalog:
+                    self._catalog[served] = dict(info, name=served)
+                if is_asr:
+                    self._active_asr = served
+                else:
+                    self._resident = [served] + [
+                        v for v in self._resident if v not in (served, name)
+                    ]
+
+            # add_model only registers; the real MLA load is deferred to first
+            # inference. Warm synchronously so a load failure is catchable and
+            # so we can time the load (this is where the wait actually happens).
+            if is_asr:
+                if not (self._warmup and self._asr_warmup):
+                    return {"name": served, "state": "ready", "evicted": evicted,
+                            "cold_start": True,
+                            "load_seconds": round(time.monotonic() - started, 1)}
+                self._log_note("Warming up (first transcription forces the load)…")
+                ok, detail = self._warm_check_asr(served)
+                if ok:
+                    self._record_load_duration(name, load_bytes,
+                                               time.monotonic() - started)
+                    self._log_note(f"Ready: {served} in {time.monotonic() - started:.1f}s")
+                    return {"name": served, "state": "ready", "evicted": evicted,
+                            "cold_start": True,
+                            "load_seconds": round(time.monotonic() - started, 1)}
+                if _is_mla_failure(detail) or self._is_probe_timeout(detail):
+                    with self._lock:
+                        self._active_asr = None
+                    return self._handle_mla_failure(served, detail)
+                if not self._is_probe_client_error(detail):
+                    # A server error or a transport failure (HTTP 5xx,
+                    # connection refused, ...) proved nothing about the
+                    # model either: no inference succeeded. Roll the switch
+                    # back rather than declare it ready.
+                    with self._lock:
+                        self._active_asr = None
+                    return self._handle_warm_failure(served, detail)
+                # Soft failure: unlike the chat probe, this one depends on the
+                # runtime's multipart handling and on how a given Whisper
+                # artifact reacts to pure silence. A 4xx here most likely
+                # means the probe's payload, not the model, was rejected, so
+                # keep it active — it will load on first use, exactly as it
+                # did before warming existed.
+                logging.warning("ASR warm-up for '%s' did not complete: %s",
+                                served, detail)
+                return {"name": served, "state": "ready", "evicted": evicted,
+                        "cold_start": True,
+                        "load_seconds": round(time.monotonic() - started, 1),
+                        "warm_warning": detail[:500]}
+
+            if not self._warmup:
+                return {"name": served, "state": "ready", "evicted": evicted,
+                        "cold_start": True, "load_seconds": round(time.monotonic() - started, 1)}
+
+            self._log_note("Warming up (first inference forces the load)…")
+            ok, detail = self._warm_check(name)
+            if ok:
+                self._record_load_duration(name, load_bytes, time.monotonic() - started)
+                self._log_note(f"Ready: {served} in {time.monotonic() - started:.1f}s")
+                return {"name": served, "state": "ready", "evicted": evicted,
+                        "cold_start": True, "load_seconds": round(time.monotonic() - started, 1)}
+
+            if _is_mla_failure(detail):
+                return self._handle_mla_failure(name, detail)
+
+            # Non-MLA warm failure: roll back so manager state stays consistent.
+            # Only the model that failed goes; the others are still resident.
+            try:
+                self._server.remove_model(name)
+            except Exception:
+                pass
+            with self._lock:
+                self._resident = [v for v in self._resident if v != name]
+            self._record_error(name, detail, kind="load")
+            raise RuntimeError(f"Model '{name}' failed to load: {detail}")
+        finally:
+            self._loading = None
 
     def set_active_asr(self, name: str) -> dict:
         """Make ``name`` the ASR model that serves transcriptions.
@@ -1471,6 +1555,8 @@ class ModelManager:
             with self._lock:
                 if name in self._resident:
                     self._resident.remove(name)
+            if removed:
+                self._reclaim_memory(f"unloading {name}")
         return {"name": name, "state": "unloaded" if removed else "absent",
                 "unload_seconds": round(time.monotonic() - started, 1)}
 
@@ -1495,6 +1581,8 @@ class ModelManager:
                     with self._lock:
                         if name in self._resident:
                             self._resident.remove(name)
+            if unloaded:
+                self._reclaim_memory("unloading every chat model")
         return {"unloaded": unloaded, "failed": failed,
                 "unload_seconds": round(time.monotonic() - started, 1)}
 
@@ -1564,6 +1652,8 @@ class ModelManager:
             with self._lock:
                 self._size_cache.pop(str(raw_path), None)
                 self._catalog.pop(name, None)
+            if registered:
+                self._reclaim_memory(f"deleting {name}")
 
         self.scan_catalog()
         return {"name": name, "state": "deleted"}
@@ -1611,6 +1701,7 @@ class ModelManager:
             "params": parse_param_count(name),
             "quantization": parse_quantization(name),
             "config": config,
+            "contextLength": self._context_length(path),
             "card": card,
             "source": "catalog",
         }
@@ -1719,6 +1810,108 @@ class ModelManager:
             return False, f"HTTP {exc.code}: {detail}".strip()
         except Exception as exc:  # noqa: BLE001 - surfaced to caller
             return False, str(exc)
+
+    # -- giving unloaded models' accelerator memory back --------------------------
+
+    def _reclaim_memory(self, reason: str) -> None:
+        """Make the MLA dispatcher free the memory of the model(s) just unloaded.
+
+        Measured on runtime 0.5.0: ``remove_model`` returns none of a model's
+        accelerator memory, and loading it again takes fresh memory, so a few
+        switches fill the pool and every load fails until a Reset MLA. The
+        dispatcher frees memory only when it has no clients at all, and this
+        server stays a client while any model is registered with it — the
+        speech-to-text model always is. So: unload every model, wait for the
+        dispatcher to go idle (it then frees everything), and load back the
+        ones that were still loaded, speech model first. That costs their load
+        time, and stops their in-flight generations.
+
+        Pointless while another program is connected to the dispatcher (its
+        clients keep it from going idle), so then it only reports that. Call
+        holding ``_op_lock``.
+        """
+        if not self._reclaim:
+            return
+        started = time.monotonic()
+        self._sync_resident_from_server()
+        registered = self._server_model_names()
+        clients = dispatcher_client_count()
+        # This server is one of the clients only while it has a model registered.
+        others = (clients - (1 if registered else 0)) if clients is not None else 0
+        if others > 0:
+            self._note_reclaim(
+                "blocked", started, reason,
+                f"{others} other program(s) are connected to the accelerator, so it "
+                "keeps the unloaded memory until they stop or the accelerator is reset")
+            return
+        with self._lock:
+            chats = list(reversed(self._resident))   # oldest first; the last is most recent
+            asr = self._active_asr
+        outer = self._loading
+        removed: list[str] = []
+        if registered:
+            self._log_note(
+                f"Freeing accelerator memory: unloading {', '.join(registered)} for a moment")
+            if outer:
+                outer.update(phase="freeing", victim=None)
+            for name in registered:
+                try:
+                    if self._unload_timed(name):
+                        removed.append(name)
+                except Exception as exc:  # noqa: BLE001 - still loads the rest back
+                    logging.warning("could not unload %s to free accelerator memory: %s", name, exc)
+            with self._lock:
+                self._resident = [v for v in self._resident if v not in removed]
+                if asr in removed:
+                    self._active_asr = None
+        idle = self._wait_dispatcher_idle()
+        failed: dict[str, str] = {}
+        try:
+            back = ([asr] if asr in removed else []) + [n for n in chats if n in removed]
+            for name in back:
+                self._log_note(f"Loading {name} back")
+                try:
+                    result = self._load_locked(name, reclaim=False)
+                    if (result or {}).get("state") != "ready":
+                        failed[name] = str(result)[:300]
+                except Exception as exc:  # noqa: BLE001 - reported with the result
+                    failed[name] = str(exc)[:300]
+        finally:
+            self._loading = outer
+            if outer:
+                outer.update(phase="loading", victim=None)
+        self._note_reclaim("freed" if idle else ("unconfirmed" if idle is None else "not-idle"),
+                           started, reason, failed=failed)
+
+    def _wait_dispatcher_idle(self, timeout: float = 10.0) -> bool | None:
+        """Wait until no program is connected to the dispatcher, plus a moment
+        for it to free the memory. None when that cannot be observed."""
+        deadline = time.monotonic() + timeout
+        while True:
+            count = dispatcher_client_count()
+            if count is None:
+                time.sleep(1.5)
+                return None
+            if count == 0:
+                time.sleep(0.5)
+                self._mla_claimed_cache = (float("-inf"), None, 0.0)   # re-measure
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.2)
+
+    def _note_reclaim(self, result: str, started: float, reason: str, detail: str = "",
+                      failed: dict | None = None) -> None:
+        self._reclaim_last = {
+            "at": time.time(), "result": result, "reason": reason,
+            "seconds": round(time.monotonic() - started, 1),
+            "detail": detail, "failed": dict(failed or {}),
+        }
+        if result == "freed" and not failed:
+            self._log_note(f"Freed the accelerator memory in {self._reclaim_last['seconds']}s")
+        else:
+            logging.warning("freeing accelerator memory (%s): %s %s %s", reason, result,
+                            detail, failed or "")
 
     def _request_supervised_reset(self, reason: str, message: str) -> dict:
         """Ask the supervisor (run.sh) to reset the MLA dispatcher and relaunch.
