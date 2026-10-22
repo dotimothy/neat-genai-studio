@@ -106,6 +106,7 @@
   .grad{background:var(--spectrum);-webkit-background-clip:text;background-clip:text;color:transparent}
   section{padding:clamp(64px,9vw,112px) 0}
   .sec-head{max-width:780px}
+  #install{padding-top:clamp(28px,4.5vw,56px)}   /* follows the hero directly */
 
   /* ---------- hero ---------- */
   .hero{position:relative;overflow-x:clip;padding-top:clamp(40px,7vw,84px);padding-bottom:clamp(40px,6vw,72px)}
@@ -258,9 +259,9 @@
       Neat GenAI Studio
     </a>
     <nav class="nav" aria-label="Sections">
+      <a class="link" href="#install">Install</a>
       <a class="link" href="#features">Features</a>
       <a class="link" href="#tour">Tour</a>
-      <a class="link" href="#install">Install</a>
       <a class="link" href="#models">Models</a>
       <button class="iconbtn" id="themeBtn" type="button" aria-label="Toggle light and dark theme">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
@@ -303,6 +304,52 @@
           <img src="media/chat.gif" width="1280" height="800" alt="Chatting with Gemma 4 E2B in Neat GenAI Studio: the reply streams in as Markdown while the latency and tokens-per-second readouts update">
         </div>
         <div class="caption">Gemma 4 E2B on a Modalix DevKit · real time, not sped up</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Install -->
+  <section id="install">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <span class="eyebrow">Get started</span>
+        <h2>Three commands <span class="grad">on the board.</span></h2>
+        <p class="lede">Run these on a Modalix with the Neat development environment and the Neat Library (<code style="font-family:var(--mono);font-size:.85em">pyneat</code>) installed.</p>
+      </div>
+      <div class="steps">
+        <div class="step reveal">
+          <div class="n">01</div>
+          <div>
+            <h3>Install</h3>
+            <p>Fetches the Studio into <code>./neat-genai-studio</code>. The installer depends only on this repository.</p>
+            <div class="cmd"><pre><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/dotimothy/neat-genai-studio/main/install.sh | bash
+<span class="p">$ </span>cd neat-genai-studio</pre><button class="copy" type="button" aria-label="Copy commands"></button></div>
+          </div>
+        </div>
+        <div class="step reveal">
+          <div class="n">02</div>
+          <div>
+            <h3>Set up</h3>
+            <p>Installs the UI environment, the Whisper and embedding models, the voices and the RAG database. <code>./run.sh</code> also does this on its first launch.</p>
+            <div class="cmd"><pre><span class="p">$ </span>./setup.sh</pre><button class="copy" type="button" aria-label="Copy command"></button></div>
+          </div>
+        </div>
+        <div class="step reveal">
+          <div class="n">03</div>
+          <div>
+            <h3>Run</h3>
+            <p>Starts the model server and the web UI, then prints the address to open. Load or download a model from <b>Settings → Models</b>.</p>
+            <div class="cmd"><pre><span class="p">$ </span>./run.sh              <span class="c"># web UI on https://&lt;board&gt;:5000</span>
+<span class="p">$ </span>./run.sh --cli        <span class="c"># or chat in the terminal</span>
+<span class="p">$ </span>./run.sh --backend-only   <span class="c"># or only the APIs</span></pre><button class="copy" type="button" data-copy="./run.sh" aria-label="Copy ./run.sh"></button></div>
+          </div>
+        </div>
+      </div>
+      <div class="req reveal">
+        <span class="chip">SiMa.ai Modalix MLSoC</span>
+        <span class="chip">Neat Library · pyneat</span>
+        <span class="chip">LLiMa runtime</span>
+        <span class="chip">Apache-2.0</span>
       </div>
     </div>
   </section>
@@ -414,52 +461,6 @@
           <div class="window"><img src="media/showcase.png" loading="lazy" alt="First slide of the showcase slideshow served at /showcase"></div>
           <figcaption><b>Showcase</b><span>A built-in slideshow for presenting the platform.</span></figcaption>
         </figure></a>
-      </div>
-    </div>
-  </section>
-
-  <!-- Install -->
-  <section id="install">
-    <div class="wrap">
-      <div class="sec-head reveal">
-        <span class="eyebrow">Get started</span>
-        <h2>Three commands <span class="grad">on the board.</span></h2>
-        <p class="lede">Run these on a Modalix with the Neat development environment and the Neat Library (<code style="font-family:var(--mono);font-size:.85em">pyneat</code>) installed.</p>
-      </div>
-      <div class="steps">
-        <div class="step reveal">
-          <div class="n">01</div>
-          <div>
-            <h3>Install</h3>
-            <p>Fetches the Studio into <code>./neat-genai-studio</code>. The installer depends only on this repository.</p>
-            <div class="cmd"><pre><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/dotimothy/neat-genai-studio/main/install.sh | bash
-<span class="p">$ </span>cd neat-genai-studio</pre><button class="copy" type="button" aria-label="Copy commands"></button></div>
-          </div>
-        </div>
-        <div class="step reveal">
-          <div class="n">02</div>
-          <div>
-            <h3>Set up</h3>
-            <p>Installs the UI environment, the Whisper and embedding models, the voices and the RAG database. <code>./run.sh</code> also does this on its first launch.</p>
-            <div class="cmd"><pre><span class="p">$ </span>./setup.sh</pre><button class="copy" type="button" aria-label="Copy command"></button></div>
-          </div>
-        </div>
-        <div class="step reveal">
-          <div class="n">03</div>
-          <div>
-            <h3>Run</h3>
-            <p>Starts the model server and the web UI, then prints the address to open. Load or download a model from <b>Settings → Models</b>.</p>
-            <div class="cmd"><pre><span class="p">$ </span>./run.sh              <span class="c"># web UI on https://&lt;board&gt;:5000</span>
-<span class="p">$ </span>./run.sh --cli        <span class="c"># or chat in the terminal</span>
-<span class="p">$ </span>./run.sh --backend-only   <span class="c"># or only the APIs</span></pre><button class="copy" type="button" data-copy="./run.sh" aria-label="Copy ./run.sh"></button></div>
-          </div>
-        </div>
-      </div>
-      <div class="req reveal">
-        <span class="chip">SiMa.ai Modalix MLSoC</span>
-        <span class="chip">Neat Library · pyneat</span>
-        <span class="chip">LLiMa runtime</span>
-        <span class="chip">Apache-2.0</span>
       </div>
     </div>
   </section>
