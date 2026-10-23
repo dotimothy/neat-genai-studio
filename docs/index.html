@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neat GenAI Studio</title>
+<meta name="description" content="On-device GenAI studio for SiMa.ai Modalix: chat, vision, speech and RAG running on the board, with a web UI, a terminal client and OpenAI-compatible APIs.">
+<meta property="og:title" content="Neat GenAI Studio">
+<meta property="og:description" content="Chat, vision, speech and RAG running entirely on a SiMa.ai Modalix board.">
+<meta property="og:image" content="https://timothydo.me/neat-genai-studio/media/home.png">
+<meta property="og:type" content="website">
+<link rel="icon" type="image/svg+xml" href="assets/studio-logo-small.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/studio-logo-32.png">
+<link rel="apple-touch-icon" href="assets/studio-logo-180.png">
+<style>
+  @font-face{font-family:'Inter';font-weight:400;font-display:swap;src:url('assets/fonts/inter-400.woff2') format('woff2')}
+  @font-face{font-family:'Inter';font-weight:600;font-display:swap;src:url('assets/fonts/inter-600.woff2') format('woff2')}
+  @font-face{font-family:'Inter';font-weight:700 900;font-display:swap;src:url('assets/fonts/inter-700.woff2') format('woff2')}
+  @font-face{font-family:'JetBrains Mono';font-weight:400;font-display:swap;src:url('assets/fonts/jetbrains-mono-400.woff2') format('woff2')}
+
+  /* Tokens from the Studio's showcase page (src/python/ui/templates/showcase.html). */
+  :root{
+    --bg:#07090d; --bg2:#0b0f16; --surface:#10161f; --surface2:#161f2b;
+    --border:#212c3b; --border2:#2c3a4d;
+    --text:#eef3f8; --text2:#aab6c4; --text3:#6c7a8a;
+    --accent:#15c9a8; --accent-ink:#052b24;
+    --s1:#16c8a6; --s2:#4bb54a; --s3:#a9c81c; --s4:#3a86ec; --s5:#f2801d;
+    --spectrum:linear-gradient(90deg,var(--s1),var(--s2),var(--s3),var(--s4),var(--s5));
+    --shadow:0 24px 60px -20px rgba(0,0,0,.7);
+    --code-bg:#0b1018;
+    --sans:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+    --mono:'JetBrains Mono',ui-monospace,'SF Mono','Cascadia Code',Menlo,Consolas,monospace;
+    --maxw:1180px;
+    color-scheme:dark;
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#eef2f7; --bg2:#e7edf4; --surface:#ffffff; --surface2:#f4f7fb;
+      --border:#d9e1ea; --border2:#c6d2df;
+      --text:#0c141d; --text2:#43566a; --text3:#7e8ea0;
+      --accent:#0a9c85; --accent-ink:#ffffff;
+      --s1:#0fae90; --s2:#3fa03f; --s3:#8aa711; --s4:#2f6fd6; --s5:#dd6f12;
+      --shadow:0 24px 60px -24px rgba(30,50,80,.28);
+      --code-bg:#0d1117;
+      color-scheme:light;
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#eef2f7; --bg2:#e7edf4; --surface:#ffffff; --surface2:#f4f7fb;
+    --border:#d9e1ea; --border2:#c6d2df;
+    --text:#0c141d; --text2:#43566a; --text3:#7e8ea0;
+    --accent:#0a9c85; --accent-ink:#ffffff;
+    --s1:#0fae90; --s2:#3fa03f; --s3:#8aa711; --s4:#2f6fd6; --s5:#dd6f12;
+    --shadow:0 24px 60px -24px rgba(30,50,80,.28);
+    --code-bg:#0d1117;
+    color-scheme:light;
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth;scroll-padding-top:76px}
+  body{
+    margin:0; background:var(--bg); color:var(--text); font-family:var(--sans);
+    font-size:16px; line-height:1.55; -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+    overflow-x:hidden;
+  }
+  body::before{content:"";position:fixed;top:0;left:0;right:0;height:3px;z-index:80;background:var(--spectrum)}
+  a{color:inherit}
+  img{max-width:100%;height:auto;display:block}
+  ::selection{background:color-mix(in srgb,var(--accent) 30%,transparent)}
+  .wrap{width:100%;max-width:var(--maxw);margin:0 auto;padding:0 clamp(16px,4vw,40px)}
+
+  /* ---------- top bar ---------- */
+  .topbar{
+    position:sticky; top:0; z-index:60; height:64px;
+    background:color-mix(in srgb,var(--bg) 78%,transparent); backdrop-filter:blur(14px);
+    border-bottom:1px solid color-mix(in srgb,var(--border) 70%,transparent);
+  }
+  .topbar .wrap{height:100%;display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .brand{display:flex;align-items:center;gap:11px;font-weight:700;letter-spacing:-.01em;text-decoration:none;white-space:nowrap}
+  .brand img{width:30px;height:30px;flex:none;filter:drop-shadow(0 2px 8px rgba(20,200,168,.35))}
+  .nav{display:flex;align-items:center;gap:6px}
+  .nav a.link{font-size:14px;color:var(--text2);text-decoration:none;padding:7px 11px;border-radius:999px;transition:.15s ease}
+  .nav a.link:hover{color:var(--text);background:var(--surface2)}
+  .iconbtn{
+    width:38px;height:38px;border-radius:999px;display:grid;place-items:center;cursor:pointer;
+    color:var(--text2);background:color-mix(in srgb,var(--surface) 80%,transparent);border:1px solid var(--border);transition:.15s ease;
+  }
+  .iconbtn:hover{color:var(--accent);border-color:var(--accent)}
+  .iconbtn svg{width:17px;height:17px}
+  .pill{
+    display:inline-flex;align-items:center;gap:8px;text-decoration:none;white-space:nowrap;
+    font-weight:700;font-size:13.5px;color:var(--accent-ink);background:var(--accent);
+    padding:9px 16px;border-radius:999px;box-shadow:0 6px 20px -6px color-mix(in srgb,var(--accent) 60%,transparent);
+    transition:transform .18s ease,box-shadow .18s ease;
+  }
+  .pill:hover{transform:translateY(-1px)}
+  .pill svg{width:16px;height:16px}
+  @media (max-width:860px){ .nav a.link{display:none} }
+  @media (max-width:420px){ .pill .lbl{display:none} .pill{padding:9px 11px} }
+
+  /* ---------- type ---------- */
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.2em;text-transform:uppercase;color:var(--accent);font-weight:600;display:inline-flex;align-items:center;gap:10px}
+  .eyebrow::before{content:"";width:22px;height:2px;background:var(--spectrum);border-radius:2px;flex:none}
+  h1{font-size:clamp(2.6rem,7vw,5.2rem);line-height:.98;letter-spacing:-.04em;font-weight:800;margin:.6rem 0 0;text-wrap:balance}
+  h2{font-size:clamp(1.9rem,4.4vw,3.1rem);line-height:1.04;letter-spacing:-.03em;font-weight:800;margin:.6rem 0 0;text-wrap:balance}
+  h3{font-size:1.08rem;letter-spacing:-.01em;margin:0 0 6px;font-weight:700}
+  .lede{font-size:clamp(1.05rem,1.7vw,1.25rem);line-height:1.55;color:var(--text2);max-width:62ch;margin:1.3rem 0 0}
+  .grad{background:var(--spectrum);-webkit-background-clip:text;background-clip:text;color:transparent}
+  section{padding:clamp(64px,9vw,112px) 0}
+  .sec-head{max-width:780px}
+  #install{padding-top:clamp(28px,4.5vw,56px)}   /* follows the hero directly */
+
+  /* ---------- hero ---------- */
+  .hero{position:relative;overflow-x:clip;padding-top:clamp(40px,7vw,84px);padding-bottom:clamp(40px,6vw,72px)}
+  .hero .glow{
+    position:absolute;inset:-10% -10% auto -10%;height:80%;z-index:0;pointer-events:none;
+    background:radial-gradient(55% 60% at 22% 0%,color-mix(in srgb,var(--s1) 20%,transparent),transparent 70%),
+               radial-gradient(45% 50% at 88% 18%,color-mix(in srgb,var(--s4) 16%,transparent),transparent 70%);
+    filter:blur(10px);
+  }
+  .hero-grid{position:relative;z-index:1;display:grid;grid-template-columns:1fr 1.05fr;gap:clamp(28px,4vw,56px);align-items:center}
+  .hero-grid > *, .step > *, .gallery > *, .models > *, .cards > *{min-width:0}
+  .cta-row{display:flex;flex-wrap:wrap;gap:14px;margin-top:2rem}
+  .btn{
+    display:inline-flex;align-items:center;gap:10px;text-decoration:none;font-weight:700;font-size:16px;
+    padding:14px 24px;border-radius:14px;color:var(--accent-ink);background:var(--accent);border:1px solid transparent;
+    box-shadow:0 12px 30px -8px color-mix(in srgb,var(--accent) 60%,transparent);transition:transform .18s ease,border-color .18s ease,color .18s ease;
+  }
+  .btn:hover{transform:translateY(-2px)}
+  .btn .arrow{transition:transform .18s ease}
+  .btn:hover .arrow{transform:translateX(4px)}
+  .btn.ghost{background:transparent;color:var(--text);border-color:var(--border2);box-shadow:none}
+  .btn.ghost:hover{border-color:var(--accent);color:var(--accent)}
+  .btn svg{width:18px;height:18px}
+  .btnnote{font-size:12px;color:var(--text3);margin-top:14px;font-family:var(--mono);letter-spacing:.04em}
+
+  .window{
+    border-radius:16px;overflow:hidden;background:var(--surface);border:1px solid var(--border);box-shadow:var(--shadow);
+  }
+  .window .bar{display:flex;align-items:center;gap:7px;padding:10px 14px;border-bottom:1px solid var(--border);background:var(--surface2)}
+  .window .bar i{width:10px;height:10px;border-radius:50%;background:var(--border2)}
+  .window .bar span{margin-left:8px;font-family:var(--mono);font-size:11px;color:var(--text3);letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .caption{font-family:var(--mono);font-size:11px;letter-spacing:.04em;color:var(--text3);margin-top:12px;text-align:center}
+
+  .statstrip{display:flex;flex-wrap:wrap;gap:18px 0;margin-top:2.4rem;border-top:1px solid var(--border);padding-top:1.4rem}
+  .stat{padding-right:22px;margin-right:22px;border-right:1px solid var(--border)}
+  .stat:last-child{border-right:none;margin-right:0;padding-right:0}
+  .stat .num{font-size:clamp(1.3rem,2.2vw,1.7rem);font-weight:800;letter-spacing:-.03em;line-height:1}
+  .stat .lbl{font-family:var(--mono);font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--text3);margin-top:7px}
+
+  /* ---------- cards ---------- */
+  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:2.4rem}
+  .card{
+    background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:22px 22px 24px;position:relative;overflow:hidden;
+    transition:transform .2s ease,border-color .2s ease;
+  }
+  .card:hover{transform:translateY(-3px);border-color:var(--border2)}
+  .card::after{content:"";position:absolute;left:0;right:0;top:0;height:2px;background:var(--spectrum);opacity:0;transition:opacity .2s ease}
+  .card:hover::after{opacity:1}
+  .card .ic{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;margin-bottom:14px;
+    background:color-mix(in srgb,var(--accent) 14%,transparent);color:var(--accent)}
+  .card .ic svg{width:20px;height:20px}
+  .card .tag{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--text3);margin-bottom:8px}
+  .card p{margin:0;color:var(--text2);font-size:14.5px}
+  .card code{font-family:var(--mono);font-size:12.5px;color:var(--text);background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:1px 6px}
+
+  /* ---------- gallery ---------- */
+  .gallery{display:grid;grid-template-columns:repeat(2,1fr);gap:22px;margin-top:2.4rem}
+  .shot{margin:0;text-decoration:none}
+  .shot .window{transition:transform .2s ease,border-color .2s ease}
+  .shot:hover .window{transform:translateY(-3px);border-color:var(--border2)}
+  .shot img{width:100%;aspect-ratio:16/10;object-fit:cover;object-position:top;background:var(--surface2)}
+  .shot figcaption{margin-top:12px}
+  .shot figcaption b{display:block;font-size:15px}
+  .shot figcaption span{font-size:13.5px;color:var(--text2)}
+
+  /* ---------- install ---------- */
+  .steps{display:grid;gap:16px;margin-top:2.4rem}
+  .step{display:grid;grid-template-columns:56px 1fr;gap:18px;align-items:start;
+    background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:22px}
+  .step .n{font-family:var(--mono);font-size:12px;letter-spacing:.12em;color:var(--accent);font-weight:600;padding-top:3px}
+  .step p{margin:4px 0 0;color:var(--text2);font-size:14.5px}
+  .step p code{font-family:var(--mono);font-size:12.5px;color:var(--text);background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:1px 6px}
+  .cmd{position:relative;margin-top:14px;background:var(--code-bg);border:1px solid var(--border);border-radius:12px}
+  .cmd pre{margin:0;padding:16px 56px 16px 18px;overflow-x:auto;font-family:var(--mono);font-size:13.5px;line-height:1.7;color:#d6e2ee}
+  .cmd .c{color:#6c7a8a}
+  .cmd .p{color:#2fd4c0;user-select:none}
+  .copy{
+    position:absolute;top:9px;right:9px;width:34px;height:34px;border-radius:9px;cursor:pointer;display:grid;place-items:center;
+    color:#aab6c4;background:#161f2b;border:1px solid #2c3a4d;transition:.15s ease;
+  }
+  .copy:hover{color:#2fd4c0;border-color:#2fd4c0}
+  .copy svg{width:15px;height:15px}
+  .copy.done{color:#35c489;border-color:#35c489}
+  .req{display:flex;flex-wrap:wrap;gap:8px;margin-top:1.4rem}
+  .chip{font-family:var(--mono);font-size:11.5px;letter-spacing:.03em;color:var(--text2);background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:6px 13px}
+
+  /* ---------- models ---------- */
+  .models{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:2.4rem}
+  .model{display:flex;flex-direction:column;text-decoration:none}
+  .model .org{font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--text3)}
+  .model h3{margin-top:4px;word-break:break-word}
+  .metrics{display:flex;flex-wrap:wrap;gap:22px;margin-top:16px;padding-top:16px;border-top:1px solid var(--border)}
+  .metrics .v{font-family:var(--mono);font-size:1.25rem;font-weight:600;font-variant-numeric:tabular-nums}
+  .metrics .k{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--text3);margin-top:4px}
+  .collections{display:flex;flex-wrap:wrap;gap:10px;margin-top:22px}
+  .collections a{font-size:14px;text-decoration:none;color:var(--text2);background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:8px 15px;transition:.15s ease}
+  .collections a:hover{color:var(--accent);border-color:var(--accent)}
+  .fineprint{font-family:var(--mono);font-size:11px;color:var(--text3);letter-spacing:.03em;margin-top:16px}
+
+  /* ---------- footer ---------- */
+  footer{border-top:1px solid var(--border);padding:40px 0 48px}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:16px 28px;align-items:center;justify-content:space-between}
+  footer .links{display:flex;flex-wrap:wrap;gap:8px 22px;font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--text3)}
+  footer .links a{text-decoration:none}
+  footer .links a:hover{color:var(--accent)}
+  footer small{font-family:var(--mono);font-size:10.5px;color:var(--text3);letter-spacing:.04em;line-height:1.6}
+
+  /* ---------- reveal ---------- */
+  .reveal{opacity:0;transform:translateY(18px);transition:opacity .7s ease,transform .7s cubic-bezier(.2,.7,.2,1)}
+  .reveal.in{opacity:1;transform:none}
+  @media (prefers-reduced-motion: reduce){
+    html{scroll-behavior:auto}
+    .reveal{opacity:1;transform:none;transition:none}
+    .card,.shot .window,.btn,.pill{transition:none}
+  }
+
+  @media (max-width:960px){
+    .hero-grid{grid-template-columns:1fr}
+    .cards{grid-template-columns:repeat(2,1fr)}
+  }
+  @media (max-width:640px){
+    .cards,.gallery,.models{grid-template-columns:1fr}
+    .step{grid-template-columns:1fr;gap:6px}
+    .stat{padding-right:18px;margin-right:18px}
+  }
+</style>
+<script>
+  // Apply a saved theme before first paint.
+  try { const t = localStorage.getItem('neat-site-theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wrap">
+    <a class="brand" href="#top">
+      <img src="assets/studio-logo.svg" width="30" height="30" alt="">
+      Neat GenAI Studio
+    </a>
+    <nav class="nav" aria-label="Sections">
+      <a class="link" href="#install">Install</a>
+      <a class="link" href="#features">Features</a>
+      <a class="link" href="#tour">Tour</a>
+      <a class="link" href="#models">Models</a>
+      <button class="iconbtn" id="themeBtn" type="button" aria-label="Toggle light and dark theme">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+      <a class="pill" href="https://github.com/dotimothy/neat-genai-studio">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.52-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.09 0 4.42-2.7 5.39-5.26 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5z"/></svg>
+        <span class="lbl">GitHub</span>
+      </a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- Hero -->
+  <section class="hero">
+    <div class="glow" aria-hidden="true"></div>
+    <div class="wrap hero-grid">
+      <div>
+        <span class="eyebrow">Powered by LLiMa · Built with Neat</span>
+        <h1>GenAI, out of the box. <span class="grad">On the edge.</span></h1>
+        <p class="lede">An on-device GenAI studio for the SiMa.ai <b>Modalix</b> MLSoC. Chat with language and vision models, talk to them, search your documents, and benchmark them, all running on the board. Use it from a web UI, a terminal client, or OpenAI-compatible APIs.</p>
+        <div class="cta-row">
+          <a class="btn" href="#install">Install on a Modalix <span class="arrow">→</span></a>
+          <a class="btn ghost" href="https://github.com/dotimothy/neat-genai-studio">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.52-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.09 0 4.42-2.7 5.39-5.26 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5z"/></svg>
+            View the Source
+          </a>
+        </div>
+        <div class="btnnote">Inference never leaves the board · the UI works offline</div>
+        <div class="statstrip">
+          <div class="stat"><div class="num grad">LLM · VLM</div><div class="lbl">Loaded on demand</div></div>
+          <div class="stat"><div class="num">Voice</div><div class="lbl">Whisper in · TTS out</div></div>
+          <div class="stat"><div class="num">OpenAI</div><div class="lbl">Compatible APIs</div></div>
+        </div>
+      </div>
+      <div>
+        <div class="window">
+          <div class="bar"><i></i><i></i><i></i><span>https://modalix:5000 · gemma-4-E2B-it-GPTQ-a16w4</span></div>
+          <img src="media/chat.gif" width="1280" height="800" alt="Chatting with Gemma 4 E2B in Neat GenAI Studio: the reply streams in as Markdown while the latency and tokens-per-second readouts update">
+        </div>
+        <div class="caption">Gemma 4 E2B on a Modalix DevKit · real time, not sped up</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Install -->
+  <section id="install">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <span class="eyebrow">Get started</span>
+        <h2>Three commands <span class="grad">on the board.</span></h2>
+        <p class="lede">Run these on a Modalix with the Neat development environment and the Neat Library (<code style="font-family:var(--mono);font-size:.85em">pyneat</code>) installed.</p>
+      </div>
+      <div class="steps">
+        <div class="step reveal">
+          <div class="n">01</div>
+          <div>
+            <h3>Install</h3>
+            <p>Fetches the Studio into <code>./neat-genai-studio</code>. The installer depends only on this repository.</p>
+            <div class="cmd"><pre><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/dotimothy/neat-genai-studio/main/install.sh | bash
+<span class="p">$ </span>cd neat-genai-studio</pre><button class="copy" type="button" aria-label="Copy commands"></button></div>
+          </div>
+        </div>
+        <div class="step reveal">
+          <div class="n">02</div>
+          <div>
+            <h3>Set up</h3>
+            <p>Installs the UI environment, the Whisper and embedding models, the voices and the RAG database. <code>./run.sh</code> also does this on its first launch.</p>
+            <div class="cmd"><pre><span class="p">$ </span>./setup.sh</pre><button class="copy" type="button" aria-label="Copy command"></button></div>
+          </div>
+        </div>
+        <div class="step reveal">
+          <div class="n">03</div>
+          <div>
+            <h3>Run</h3>
+            <p>Starts the model server and the web UI, then prints the address to open. Load or download a model from <b>Settings → Models</b>.</p>
+            <div class="cmd"><pre><span class="p">$ </span>./run.sh              <span class="c"># web UI on https://&lt;board&gt;:5000</span>
+<span class="p">$ </span>./run.sh --cli        <span class="c"># or chat in the terminal</span>
+<span class="p">$ </span>./run.sh --backend-only   <span class="c"># or only the APIs</span></pre><button class="copy" type="button" data-copy="./run.sh" aria-label="Copy ./run.sh"></button></div>
+          </div>
+        </div>
+      </div>
+      <div class="req reveal">
+        <span class="chip">SiMa.ai Modalix MLSoC</span>
+        <span class="chip">Neat Library · pyneat</span>
+        <span class="chip">LLiMa runtime</span>
+        <span class="chip">Apache-2.0</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section id="features">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <span class="eyebrow">What's inside</span>
+        <h2>One studio for <span class="grad">every modality</span> on the chip.</h2>
+        <p class="lede">The Studio starts with no chat model loaded. Pick one from the board or from Hugging Face, and it loads without a restart.</p>
+      </div>
+      <div class="cards">
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+          <div class="tag">Chat &amp; vision</div>
+          <h3>Ask about text, images and cameras</h3>
+          <p>Stream Markdown, code and LaTeX replies. Upload a photo, use the browser camera, or snap one from a camera on the board for a vision-language model.</p>
+        </div>
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></div>
+          <div class="tag">Model switching</div>
+          <h3>Load, switch, keep several</h3>
+          <p>Load models at runtime with live progress. Keep one or several loaded side by side, and watch the accelerator's memory as you go.</p>
+        </div>
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg></div>
+          <div class="tag">Speech</div>
+          <h3>Talk to it, hear it answer</h3>
+          <p>Whisper transcribes on the accelerator. Replies are spoken by Supertonic or Piper voices, in English, German, Spanish, French, Italian, Japanese, Chinese and more.</p>
+        </div>
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></div>
+          <div class="tag">RAG</div>
+          <h3>Answer from your documents</h3>
+          <p>Upload or import documents into a local Milvus Lite database with GTE-small embeddings, and let chat search them. Inspect, reset or clear it from Settings.</p>
+        </div>
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 13l3-3"/><path d="M3.3 17a9 9 0 1 1 17.4 0"/><circle cx="12" cy="13" r="1"/></svg></div>
+          <div class="tag">Benchmark</div>
+          <h3>Measure TTFT and tokens per second</h3>
+          <p>Benchmark one, several or all models, compare them side by side, and export the results as CSV or JSON, from the UI or the terminal.</p>
+        </div>
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div>
+          <div class="tag">APIs</div>
+          <h3>OpenAI-compatible endpoints</h3>
+          <p>Chat completions plus <code>/v1/audio/speech</code>, transcriptions and translations, with an API playground. <code>--backend-only</code> serves them without the UI for other front ends.</p>
+        </div>
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div>
+          <div class="tag">Terminal</div>
+          <h3>A chat client for SSH sessions</h3>
+          <p><code>./run.sh --cli</code> chats, loads, downloads and benchmarks models from the terminal, with several models open at once.</p>
+        </div>
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></div>
+          <div class="tag">Hugging Face</div>
+          <h3>Download compiled models</h3>
+          <p>Browse Modalix builds from SiMa.ai and community accounts, with download sizes and the free NVMe space, and download them straight to the board.</p>
+        </div>
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
+          <div class="tag">Solutions</div>
+          <h3>SiMaSentry demo harnesses</h3>
+          <p>Med for clinical imaging, Safe for PPE and hazard inspection, Sec for threat analysis, each wired to the loaded model.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Tour -->
+  <section id="tour">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <span class="eyebrow">A quick tour</span>
+        <h2>Captured on a <span class="grad">Modalix DevKit.</span></h2>
+      </div>
+      <div class="gallery">
+        <a class="shot reveal" href="media/vision.gif"><figure style="margin:0">
+          <div class="window"><img src="media/vision.gif" loading="lazy" alt="Uploading a photo of Earth and asking the vision-language model what it shows"></div>
+          <figcaption><b>Ask about an image</b><span>A vision-language model describes NASA's Apollo 17 photo of Earth.</span></figcaption>
+        </figure></a>
+        <a class="shot reveal" href="media/load-model.gif"><figure style="margin:0">
+          <div class="window"><img src="media/load-model.gif" loading="lazy" alt="Loading a model from Settings, Models with a live progress bar"></div>
+          <figcaption><b>Load a model without restarting</b><span>Live progress while the weights move to the accelerator.</span></figcaption>
+        </figure></a>
+        <a class="shot reveal" href="media/home.png"><figure style="margin:0">
+          <div class="window"><img src="media/home.png" loading="lazy" alt="Studio home screen in the dark theme with a vision model loaded"></div>
+          <figcaption><b>Home</b><span>Transcription, answer and speech timings at a glance.</span></figcaption>
+        </figure></a>
+        <a class="shot reveal" href="media/chat-light.png"><figure style="margin:0">
+          <div class="window"><img src="media/chat-light.png" loading="lazy" alt="A reply with bullet points and rendered LaTeX in the light theme"></div>
+          <figcaption><b>Markdown and math</b><span>Light and dark themes, with your choice of font.</span></figcaption>
+        </figure></a>
+        <a class="shot reveal" href="media/benchmark.png"><figure style="margin:0">
+          <div class="window"><img src="media/benchmark.png" loading="lazy" alt="Benchmark results with time to first token and tokens per second across five runs"></div>
+          <figcaption><b>Benchmark</b><span>Time to first token and tokens per second, run by run.</span></figcaption>
+        </figure></a>
+        <a class="shot reveal" href="media/playground.png"><figure style="margin:0">
+          <div class="window"><img src="media/playground.png" loading="lazy" alt="Audio API playground after synthesizing a sentence, showing the waveform and timings"></div>
+          <figcaption><b>Audio API playground</b><span>Try speech, transcription and translation requests in the browser.</span></figcaption>
+        </figure></a>
+        <a class="shot reveal" href="media/solutions.png"><figure style="margin:0">
+          <div class="window"><img src="media/solutions.png" loading="lazy" alt="SiMaSentry Mission Control with the Med, Safe and Sec harness cards"></div>
+          <figcaption><b>SiMaSentry Solutions</b><span>Three demo harnesses that use the loaded model.</span></figcaption>
+        </figure></a>
+        <a class="shot reveal" href="media/showcase.png"><figure style="margin:0">
+          <div class="window"><img src="media/showcase.png" loading="lazy" alt="First slide of the showcase slideshow served at /showcase"></div>
+          <figcaption><b>Showcase</b><span>A built-in slideshow for presenting the platform.</span></figcaption>
+        </figure></a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Models -->
+  <section id="models">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <span class="eyebrow">Models</span>
+        <h2>Compiled for Modalix, <span class="grad">one click away.</span></h2>
+        <p class="lede">The Studio's Hugging Face browser searches <b>dotimothy</b>, <b>simaai</b> and <b>florianvoss</b> by default. These reasoning models were quantized to INT4 with GPTQ and compiled for Modalix with LLiMa.</p>
+      </div>
+      <div class="models">
+        <a class="card model reveal" href="https://huggingface.co/dotimothy/DeepSeek-R1-Distill-Llama-8B-GPTQ-a16w4">
+          <div class="org">dotimothy /</div>
+          <h3>DeepSeek-R1-Distill-Llama-8B-GPTQ-a16w4</h3>
+          <p>An 8B reasoning model with INT4 weights, INT8 KV cache and an 8192-token context.</p>
+          <div class="metrics">
+            <div><div class="v grad">~11</div><div class="k">tokens / s</div></div>
+            <div><div class="v">12/12</div><div class="k">arithmetic check</div></div>
+            <div><div class="v">8192</div><div class="k">context</div></div>
+          </div>
+        </a>
+        <a class="card model reveal" href="https://huggingface.co/dotimothy/DeepSeek-R1-Distill-Qwen-1.5B-GPTQ-a16w4">
+          <div class="org">dotimothy /</div>
+          <h3>DeepSeek-R1-Distill-Qwen-1.5B-GPTQ-a16w4</h3>
+          <p>A fast 1.5B reasoning model with INT4 weights, BF16 KV cache and an 8192-token context.</p>
+          <div class="metrics">
+            <div><div class="v grad">46</div><div class="k">tokens / s</div></div>
+            <div><div class="v">7/12</div><div class="k">arithmetic check</div></div>
+            <div><div class="v">8192</div><div class="k">context</div></div>
+          </div>
+        </a>
+      </div>
+      <div class="collections reveal">
+        <a href="https://huggingface.co/collections/dotimothy/llima-llm-models-6ad91bade87990eeeab2d394">LLiMa LLM Models →</a>
+        <a href="https://huggingface.co/collections/dotimothy/llima-vlm-models-6ad91bae79ae3b5877e36b74">LLiMa VLM Models →</a>
+        <a href="https://huggingface.co/simaai">SiMa.ai on Hugging Face →</a>
+      </div>
+      <div class="fineprint reveal">Decode speed at short prompts on a Modalix DevKit. The arithmetic check is 12 greedy-decoded questions, as described on each model card.</div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="links">
+      <a href="https://github.com/dotimothy/neat-genai-studio">GitHub</a>
+      <a href="https://github.com/dotimothy/neat-genai-studio#readme">Documentation</a>
+      <a href="https://github.com/dotimothy/neat-genai-studio/issues">Issues</a>
+      <a href="https://huggingface.co/dotimothy">Hugging Face</a>
+    </div>
+    <small>Neat GenAI Studio · Apache-2.0 · for SiMa.ai Modalix</small>
+  </div>
+</footer>
+
+<script>
+  // Theme toggle (remembered per browser when storage is available).
+  document.getElementById('themeBtn').addEventListener('click', () => {
+    const root = document.documentElement;
+    const dark = root.dataset.theme ? root.dataset.theme === 'dark'
+                                    : !matchMedia('(prefers-color-scheme: light)').matches;
+    root.dataset.theme = dark ? 'light' : 'dark';
+    try { localStorage.setItem('neat-site-theme', root.dataset.theme); } catch (e) {}
+  });
+
+  // Copy buttons on the install commands (without the prompts and comments).
+  const COPY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+  const DONE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+  document.querySelectorAll('.copy').forEach(btn => {
+    btn.innerHTML = COPY;
+    btn.addEventListener('click', async () => {
+      // A block of alternatives says which one to copy; others copy every line.
+      const pre = btn.parentElement.querySelector('pre').cloneNode(true);
+      pre.querySelectorAll('.p, .c').forEach(el => el.remove());
+      const text = btn.dataset.copy || pre.textContent.split('\n').map(l => l.trimEnd()).join('\n').trim();
+      try {
+        await navigator.clipboard.writeText(text);
+        btn.innerHTML = DONE; btn.classList.add('done');
+        setTimeout(() => { btn.innerHTML = COPY; btn.classList.remove('done'); }, 1600);
+      } catch (e) {}
+    });
+  });
+
+  // Reveal sections as they scroll in.
+  const items = document.querySelectorAll('.reveal');
+  if ('IntersectionObserver' in window) {
+    const io = new IntersectionObserver(entries => entries.forEach(e => {
+      if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+    }), { rootMargin: '0px 0px -8% 0px' });
+    items.forEach(el => io.observe(el));
+  } else {
+    items.forEach(el => el.classList.add('in'));
+  }
+</script>
+</body>
+</html>
