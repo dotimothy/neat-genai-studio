@@ -1947,8 +1947,8 @@ class AppContext:
 
         @self.app.route('/favicon.ico')
         def favicon():
-            # Serve the Neat logo for bare /favicon.ico requests too.
-            return self.app.send_static_file('icons/neat-logo.png')
+            # Serve the Studio logo for bare /favicon.ico requests too.
+            return self.app.send_static_file('icons/favicon.ico')
 
         @self.app.route('/models/status', methods=['GET'])
         def models_status():

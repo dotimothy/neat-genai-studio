@@ -9,7 +9,9 @@
 <meta property="og:description" content="Chat, vision, speech and RAG running entirely on a SiMa.ai Modalix board.">
 <meta property="og:image" content="https://timothydo.me/neat-genai-studio/media/home.png">
 <meta property="og:type" content="website">
-<link rel="icon" type="image/png" href="assets/neat-logo.png">
+<link rel="icon" type="image/svg+xml" href="assets/studio-logo-small.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/studio-logo-32.png">
+<link rel="apple-touch-icon" href="assets/studio-logo-180.png">
 <style>
   @font-face{font-family:'Inter';font-weight:400;font-display:swap;src:url('assets/fonts/inter-400.woff2') format('woff2')}
   @font-face{font-family:'Inter';font-weight:600;font-display:swap;src:url('assets/fonts/inter-600.woff2') format('woff2')}
@@ -75,7 +77,7 @@
   }
   .topbar .wrap{height:100%;display:flex;align-items:center;justify-content:space-between;gap:16px}
   .brand{display:flex;align-items:center;gap:11px;font-weight:700;letter-spacing:-.01em;text-decoration:none;white-space:nowrap}
-  .brand svg{width:26px;height:26px;flex:none;filter:drop-shadow(0 2px 8px rgba(20,200,168,.35))}
+  .brand img{width:30px;height:30px;flex:none;filter:drop-shadow(0 2px 8px rgba(20,200,168,.35))}
   .nav{display:flex;align-items:center;gap:6px}
   .nav a.link{font-size:14px;color:var(--text2);text-decoration:none;padding:7px 11px;border-radius:999px;transition:.15s ease}
   .nav a.link:hover{color:var(--text);background:var(--surface2)}
@@ -240,22 +242,10 @@
 </head>
 <body>
 
-<svg width="0" height="0" style="position:absolute" aria-hidden="true">
-  <defs>
-    <linearGradient id="dg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#16c8a6"/><stop offset=".4" stop-color="#4bb54a"/>
-      <stop offset=".55" stop-color="#a9c81c"/><stop offset=".72" stop-color="#3a86ec"/><stop offset="1" stop-color="#f2801d"/>
-    </linearGradient>
-  </defs>
-</svg>
-
 <header class="topbar">
   <div class="wrap">
     <a class="brand" href="#top">
-      <svg viewBox="0 0 40 40" aria-hidden="true">
-        <path d="M20 1 L37 20 L20 39 L3 20 Z" fill="url(#dg)"/>
-        <path d="M20 1 L20 39 M3 20 L37 20 M20 1 L37 20 L20 39 L3 20 Z" fill="none" stroke="rgba(0,0,0,.28)" stroke-width="1"/>
-      </svg>
+      <img src="assets/studio-logo.svg" width="30" height="30" alt="">
       Neat GenAI Studio
     </a>
     <nav class="nav" aria-label="Sections">

@@ -869,13 +869,13 @@ desktop_entry() {
     exec_line="Exec=x-terminal-emulator -T \"Neat GenAI Studio\" -e \"${launch}\""
     printf '%s\n' "[Desktop Entry]" "Version=1.0" "Type=Application" "Name=Neat GenAI Studio" \
       "Comment=Run LLMs, VLMs, speech-to-text and text-to-speech on the Modalix MLA" \
-      "${exec_line}" "Path=${EXAMPLE_DIR}" "Icon=${EXAMPLE_DIR}/src/python/ui/static/icons/neat-logo.png" \
+      "${exec_line}" "Path=${EXAMPLE_DIR}" "Icon=${EXAMPLE_DIR}/src/python/ui/static/icons/studio-logo-512.png" \
       "Terminal=false" "Categories=Development;" "Keywords=LLM;GenAI;SiMa;Modalix;Neat;" \
       "StartupNotify=false"
   else
     printf '%s\n' "[Desktop Entry]" "Version=1.0" "Type=Application" "Name=Neat GenAI Studio" \
       "Comment=Run LLMs, VLMs, speech-to-text and text-to-speech on the Modalix MLA" \
-      "Exec=\"${launch}\"" "Path=${EXAMPLE_DIR}" "Icon=${EXAMPLE_DIR}/src/python/ui/static/icons/neat-logo.png" \
+      "Exec=\"${launch}\"" "Path=${EXAMPLE_DIR}" "Icon=${EXAMPLE_DIR}/src/python/ui/static/icons/studio-logo-512.png" \
       "Terminal=true" "Categories=Development;" "Keywords=LLM;GenAI;SiMa;Modalix;Neat;" \
       "StartupNotify=false"
   fi

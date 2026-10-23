@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/studio-logo.svg" alt="Neat GenAI Studio logo" width="128">
+</p>
+
 # Neat GenAI Studio
 
 <p align="center">

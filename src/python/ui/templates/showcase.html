@@ -6,7 +6,8 @@
 <meta name="theme-color" content="#07090d">
 <script>/* Apply the saved theme before first paint (same localStorage key as the Studio). */
 try{var _t=localStorage.getItem('theme');if(_t==='light'||_t==='dark'){document.documentElement.setAttribute('data-theme',_t);var _m=document.querySelector('meta[name="theme-color"]');if(_m)_m.setAttribute('content',_t==='light'?'#eef2f7':'#07090d');}}catch(e){}</script>
-<link rel="icon" type="image/png" href="{{ url_for('static', filename='icons/neat-logo.png') }}">
+<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='icons/studio-logo-small.svg') }}">
+<link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='icons/studio-logo-32.png') }}">
 <title>Neat GenAI Studio · Edge GenAI on SiMa.ai Modalix</title>
 <style>
   :root{
@@ -547,16 +548,7 @@ try { if (window.top !== window.self) document.documentElement.classList.add('em
 <div class="progress" aria-hidden="true"><i id="prog"></i></div>
 <header class="topbar">
   <div class="brand">
-    <span class="mark" aria-hidden="true">
-      <svg viewBox="0 0 40 40"><defs>
-        <linearGradient id="dg" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0" stop-color="#16c8a6"/><stop offset=".4" stop-color="#4bb54a"/>
-          <stop offset=".55" stop-color="#a9c81c"/><stop offset=".72" stop-color="#3a86ec"/><stop offset="1" stop-color="#f2801d"/>
-        </linearGradient></defs>
-        <path d="M20 1 L37 20 L20 39 L3 20 Z" fill="url(#dg)"/>
-        <path d="M20 1 L20 39 M3 20 L37 20 M20 1 L37 20 L20 39 L3 20 Z" fill="none" stroke="rgba(0,0,0,.28)" stroke-width="1"/>
-      </svg>
-    </span>
+    <img class="mark" src="{{ url_for('static', filename='icons/studio-logo.svg') }}" alt="">
     <b>Neat GenAI&nbsp;Studio</b>
     <span class="divide"></span>
     <a class="simalink" href="https://sima.ai" target="_blank" rel="noopener" aria-label="SiMa.ai">
