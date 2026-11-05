@@ -110,8 +110,6 @@ class _ControlHandler(BaseHTTPRequestHandler):
                 self._send_json(self.manager.unload_all())
             elif path == "/control/delete":
                 self._send_json(self.manager.delete(str(body.get("name", ""))))
-            elif path == "/control/reset_mla":
-                self._send_json(self.manager.reset_mla())
             elif path == "/control/rescan":
                 catalog = self.manager.scan_catalog()
                 self._send_json(dict(self.manager.residency(), catalog=catalog))

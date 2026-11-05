@@ -4345,11 +4345,11 @@ function renderMlaMemory() {
     const list = entries.map(([name, bytes]) => `${name} ≈ ${mlaFmt(bytes)}`).join(' · ');
     const parts = [];
     if (claimed != null) {
-      parts.push((high ? 'Nearly full: a load may fail until Reset MLA releases what the runtime is holding. ' : '')
+      parts.push((high ? 'Nearly full: a load may fail until you unload a model or restart the Studio. ' : '')
         + 'Held by the runtime is measured for the whole board, including other programs on the accelerator, and is not always released when a model is unloaded.');
     }
     if (list) parts.push(`${list} (estimated from each model’s accelerator files).`);
-    if (claimed == null) parts.push('The memory the runtime holds could not be read, so only the estimate is shown; other programs on the accelerator are not counted.');
+    if (claimed == null) parts.push('Only the estimate is shown; other programs on the accelerator are not counted.');
     note.textContent = parts.join(' ');
   }
 }
@@ -4635,7 +4635,6 @@ function initActiveModelMenu() {
 // <select id="chatModelSelect"> stays the source of truth for the rest of the app.
 let _catalog = [];
 let _pendingLoad = '';    // name of the model currently loading (for the row label)
-let _resetting = false;   // an accelerator reset + server relaunch is in flight
 let _loadTicker = null;   // client-side load countdown (see startLoadTicker)
 let _lastServerLoadUpdate = 0;   // when the server last reported real progress
 let _asrActive = '';     // ASR model serving transcriptions (from the catalog)
@@ -4878,25 +4877,18 @@ function updateHomeModelIndicator() {
 // Refresh the per-row actions in the model list (Load / Unload / active state)
 // and composer whenever model state changes.
 function updateManageButtons() {
-  // Deliberately NOT disabled by _modelBusy: a wedged load holds that flag for
-  // the life of the request (up to 600s), which is exactly when this recovery
-  // action is needed. reset_mla() bypasses the server's op-lock for the same
-  // reason. Only a reset already in flight disables it.
-  const mlaReset = document.getElementById('mlaResetButton');
-  if (mlaReset) mlaReset.disabled = _resetting;
   renderResidentLimit();
   renderInstalledList();
   renderAsrList();
   updateComposerEnabled();
 }
 
-// A model is usable for chat only once it is FULLY resident (not mid-load and
-// not mid-reset). The composer is locked until then.
+// A model is usable for chat only once it is FULLY resident (not mid-load).
+// The composer is locked until then.
 function serverBusy() {
   // Any state in which the model server cannot service a request: a model
-  // operation in flight, or a reset during which the old server is exiting and
-  // the replacement is not yet up.
-  return _modelBusy || _resetting;
+  // operation in flight.
+  return _modelBusy;
 }
 
 function modelReady() {
@@ -4941,8 +4933,6 @@ function initModelManage() {
   const sel = document.getElementById('chatModelSelect');
   if (sel) sel.addEventListener('change', updateManageButtons);
 
-  const mlaReset = document.getElementById('mlaResetButton');
-  if (mlaReset) mlaReset.addEventListener('click', () => resetMla());
   const unloadAll = document.getElementById('modelUnloadAll');
   if (unloadAll) unloadAll.addEventListener('click', () => unloadAllModels());
 
@@ -5146,126 +5136,6 @@ function stopLoadTicker() {
 function modelLoadHints(name) {
   const m = _catalog.find(x => x.name === name) || {};
   return { est: m.estimatedLoadS, stages: m.stagesTotal };
-}
-
-// Reset the accelerator: asks the model server to exit with the sentinel code so
-// the supervisor (run.sh) restarts the MLA dispatcher — which owns models across
-// processes, so killing the server alone does not free them — and relaunches it.
-// Explicit only: nothing else in the studio triggers this.
-// The reset route is board-wide. A token is off by default; a Studio started
-// with STUDIO_RESET_AUTH=1 answers 401 without one, and only then is the user
-// asked for it (run.sh prints it at startup). It is remembered afterwards, and
-// a later 401 forgets it.
-const RESET_TOKEN_KEY = 'resetMlaToken';
-function storedResetToken() {
-  try { return localStorage.getItem(RESET_TOKEN_KEY) || ''; } catch (e) { return ''; }
-}
-
-// Ask for the token. Returns it, or null when the prompt was cancelled or left empty.
-function askResetToken() {
-  const typed = window.prompt(
-    'This Studio requires a token for Reset MLA. It is the one run.sh printed at '
-    + 'startup (also in .neat-genai-reset.token on the board).');
-  const token = typed === null ? '' : typed.trim();
-  if (!token) return null;
-  try { localStorage.setItem(RESET_TOKEN_KEY, token); } catch (e) { /* ignore */ }
-  return token;
-}
-
-async function resetMla() {
-  if (_resetting) return;
-  if (!window.confirm('Reset the accelerator (MLA)?\n\nThis unloads all models and briefly '
-      + 'restarts the model server — it will be unavailable for a few seconds. '
-      + 'In-progress generation will stop.')) return;
-  _resetting = true;
-  stopLoadPolling();          // the outgoing server's log feed is about to die
-  stopLoadTicker();
-  clearModelError();
-  updateManageButtons();
-  setModelStatus('Resetting the accelerator and restarting…', 'loading');
-  setModelLoadBar('active');
-  try {
-    // The server exits ~1.5s after replying, so this may never return — that is
-    // the success path, not a failure. A response that does arrive can still be
-    // a refusal (MLA_RESET=0 answers 400): surface it instead of waiting for a
-    // restart that will never happen and then reporting the old server as new.
-    let refused = '';
-    try {
-      const post = (token) => fetch('/models/reset-mla', {
-        method: 'POST', headers: token ? { 'X-Reset-Token': token } : {},
-      });
-      let r = await post(storedResetToken());
-      if (r.status === 401) {
-        // This Studio wants a token and has none, or a stale one: ask, then retry once.
-        try { localStorage.removeItem(RESET_TOKEN_KEY); } catch (e) { /* ignore */ }
-        const token = askResetToken();
-        if (token === null) {              // the prompt was cancelled
-          _resetting = false;
-          setModelLoadBar(null);
-          updateManageButtons();
-          setModelStatus('Reset cancelled', '');
-          return;
-        }
-        r = await post(token);
-      }
-      if (!r.ok) {
-        const d = await r.json().catch(() => ({}));
-        if (r.status === 401) {
-          try { localStorage.removeItem(RESET_TOKEN_KEY); } catch (e) { /* ignore */ }
-        }
-        refused = (d && (d.error || d.message)) || `reset refused (HTTP ${r.status})`;
-      }
-    } catch (e) {
-      // The UI process stays up while the model server restarts, and the route
-      // turns the model server's disconnect into a normal HTTP response, so a
-      // rejected fetch here is a browser<->Studio transport failure, not a
-      // reset that started. Do not wait for a restart and then report one.
-      refused = `could not reach the Studio (${e && e.message ? e.message : 'network error'})`;
-    }
-    if (refused) {
-      // Nothing was reset: release the lock but keep the refusal on screen
-      // (the restart cleanup below would replace it with the catalog status).
-      _resetting = false;
-      setModelLoadBar(null);
-      updateManageButtons();
-      setModelStatus(`Reset refused: ${refused}`, 'error');
-      return;
-    }
-    await waitForServerBack();
-  } finally {
-    if (_resetting) {
-      // Always release the lock, even if the wait threw, so the UI cannot get
-      // stuck with every action disabled.
-      _resetting = false;
-      _modelBusy = false;       // a wedged load is gone with the restart
-      setModelLoadBar(null);
-      clearModelError();        // drop a stale error a concurrent load's 502 raised
-      await refreshCatalog();
-      updateManageButtons();
-      if (typeof updateSelectedModelVisionState === 'function') updateSelectedModelVisionState();
-    }
-  }
-}
-
-// Poll /models/status until the relaunched model server answers.
-async function waitForServerBack() {
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  const start = Date.now();
-  const timeoutMs = 90000;
-  await sleep(2500);          // let the old process exit before polling
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const r = await fetch('/models/status', { cache: 'no-store' });
-      if (r.ok) {
-        const d = await r.json().catch(() => ({}));
-        // Back up. Whether the dispatcher itself was reset depends on run.sh
-        // having the privileges, so do not over-claim a full accelerator reset.
-        if (d && !d.error) { setModelStatus('Model server restarted — ready', 'ready'); return; }
-      }
-    } catch (e) { /* still down */ }
-    await sleep(1500);
-  }
-  setModelStatus('Reset requested, but the server is slow to return — check run.sh.', 'error');
 }
 
 // ---- Speech-to-text (ASR) models --------------------------------------------
@@ -5494,7 +5364,7 @@ async function loadModelAndActivate(name) {
     if (typeof updateSelectedModelVisionState === 'function') updateSelectedModelVisionState();
     return; // already resident
   }
-  // Incomplete weights can't load — surface it directly (a reset won't help).
+  // Incomplete weights can't load — surface it directly.
   if (option && option.dataset.complete === 'false') {
     setModelStatus('Model weights are incomplete', 'error');
     showModelError(name, `${option.dataset.incompleteReason || 'The weights are incomplete'}. Re-download it from the Add Model tab.`);
