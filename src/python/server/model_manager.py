@@ -32,7 +32,14 @@ from pathlib import Path
 
 from shared.chat_template import generation_opens_thinking, repair_chat_template_files
 from shared.config import (HubConfig, classify_model_dir, model_dir_complete,
-                           model_dir_supported)
+                           model_runtime_dirs)
+
+
+def _target_dir(path) -> Path:
+    """Where a model's runtime files live: the package root for a flat model,
+    the target's subfolder for a target/draft (speculative decoding) pair."""
+    components = model_runtime_dirs(Path(path))
+    return components[0] if components else Path(path)
 
 
 def parse_param_count(name: str) -> str | None:
@@ -325,7 +332,8 @@ class ModelManager:
         key = str(path)
         cached = self._opens_thinking_cache.get(key)
         if cached is None:
-            cached = (generation_opens_thinking(path), generation_opens_thinking(path, False))
+            target = _target_dir(path)
+            cached = (generation_opens_thinking(target), generation_opens_thinking(target, False))
             self._opens_thinking_cache[key] = cached
         return cached
 
@@ -339,7 +347,7 @@ class ModelManager:
         if key not in self._context_cache:
             value = None
             try:
-                raw = json.loads((Path(path) / "devkit" / "vlm_config.json").read_text(encoding="utf-8"))
+                raw = json.loads((_target_dir(path) / "devkit" / "vlm_config.json").read_text(encoding="utf-8"))
                 n = int((raw.get("pipeline_cfg") or {}).get("max_num_tokens") or 0)
                 value = n if n > 0 else None
             except (OSError, ValueError, TypeError, AttributeError):
@@ -365,7 +373,6 @@ class ModelManager:
         entries = []                                # outside the lock (walks are slow)
         for info in infos:
             complete, reason = self._is_model_complete(info.get("path"))
-            supported, unsupported_reason = model_dir_supported(info.get("path"))
             path = info.get("path")
             entries.append({
                 "name": info["name"],
@@ -401,8 +408,8 @@ class ModelManager:
                 # Distinct from "complete": an unsupported build downloaded
                 # perfectly. Conflating them tells the user to re-download
                 # gigabytes that will fail the same way.
-                "supported": supported,
-                "unsupportedReason": unsupported_reason or None,
+                "supported": True,
+                "unsupportedReason": None,
             })
         entries.sort(key=lambda e: (e["type"] == "asr", e["name"].lower()))
         return entries
@@ -687,9 +694,6 @@ class ModelManager:
         # Refuse to load a model whose weights are missing/partial — otherwise
         # it fails deep in the MLA with a confusing error.
         complete, reason = self._is_model_complete(path)
-        ok_supported, why_unsupported = model_dir_supported(path)
-        if not ok_supported:
-            raise ValueError(f"'{name}' cannot be loaded — {why_unsupported}")
         if not complete:
             raise ValueError(
                 f"'{name}' cannot be loaded — {reason}. Re-download it from Add Model."
@@ -699,8 +703,9 @@ class ModelManager:
         # Hub layout) before the runtime's minja parser ever sees them —
         # this also fixes models downloaded before the repair existed.
         try:
-            for fix in repair_chat_template_files(path):
-                logging.info("model '%s': %s", name, fix)
+            for root in model_runtime_dirs(Path(path)) or [Path(path)]:
+                for fix in repair_chat_template_files(root):
+                    logging.info("model '%s': %s", name, fix)
         except Exception:  # noqa: BLE001 - repair is best-effort
             pass
 
@@ -945,7 +950,8 @@ class ModelManager:
             return None
         try:
             total = sum(f.stat().st_size
-                        for f in Path(path).glob("elf_files/*_mla.elf"))
+                        for root in model_runtime_dirs(Path(path))
+                        for f in root.glob("elf_files/*_mla.elf"))
         except Exception:
             return None
         return total or None
@@ -1066,10 +1072,8 @@ class ModelManager:
     def _count_elf_stages(self, path) -> int | None:
         """Number of ELF stages on disk for a model (the load-progress total)."""
         try:
-            elf_dir = Path(path) / "elf_files"
-            if not elf_dir.is_dir():
-                return None
-            n = sum(1 for f in elf_dir.iterdir() if f.name.endswith("_mla.elf"))
+            n = sum(1 for root in model_runtime_dirs(Path(path))
+                    for f in root.glob("elf_files/*_mla.elf"))
             return n or None
         except Exception:
             return None
@@ -1184,9 +1188,14 @@ class ModelManager:
                     break
                 try:
                     obj = json.loads(data)
-                except Exception:
+                except ValueError:
                     continue
-                # Runtime metrics streamed by the server (authoritative).
+                if obj.get("error"):
+                    err = obj["error"]
+                    raise RuntimeError(err.get("message") if isinstance(err, dict) else str(err))
+                # Runtime metrics streamed by the server (authoritative),
+                # including the count of tokens generated so far.
+                tokens = obj.get("generated_tokens", tokens)
                 if "ttft" in obj:
                     try: srv_ttft = float(obj["ttft"])
                     except (TypeError, ValueError): pass
@@ -1194,14 +1203,19 @@ class ModelManager:
                     try: srv_tps = float(obj["tps"])
                     except (TypeError, ValueError): pass
                 choices = obj.get("choices") or []
-                delta = choices[0].get("delta", {}).get("content") if choices else None
+                chunk = choices[0].get("delta", {}) if choices else {}
+                # Reasoning models stream their thinking separately; it is
+                # generated tokens too.
+                delta = (chunk.get("content") or chunk.get("reasoning_content")
+                         or chunk.get("reasoning"))
                 if not delta:
                     continue
                 now = time.monotonic()
                 if t_first is None:
                     t_first = now
                 t_last = now
-                tokens += 1
+                if "generated_tokens" not in obj:
+                    tokens += 1          # no runtime count: one per chunk
                 parts.append(delta)
                 # Throttle the live update so it never perturbs the timing.
                 if now - last_live > 0.12:
@@ -1477,7 +1491,7 @@ class ModelManager:
                         break
                     except OSError:
                         continue
-            vlm_cfg = p / "devkit" / "vlm_config.json"
+            vlm_cfg = _target_dir(p) / "devkit" / "vlm_config.json"
             if vlm_cfg.is_file():
                 try:
                     raw = json.loads(vlm_cfg.read_text(encoding="utf-8"))

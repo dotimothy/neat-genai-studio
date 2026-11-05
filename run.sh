@@ -437,10 +437,12 @@ supertonic_installed() {
      && -f "${SUPERTONIC_MODELS_ROOT_RESOLVED}/supertonic-3-sima/supertonic_vector_field_sima_mpk.tar.gz" ]]
 }
 # What a dependency refresh would change for Supertonic: its pinned requirements
-# and the reviewed model revisions/checksums in setup.sh.
+# the compiled-model pins in model_assets.json, and the reviewed model
+# revisions/checksums in setup.sh.
 supertonic_fingerprint() {
   {
-    cat "${PYTHON_DIR}/requirements-supertonic.txt" 2>/dev/null
+    cat "${PYTHON_DIR}/requirements-supertonic.txt" \
+      "${PYTHON_DIR}/ui/supertonic_sima/model_assets.json" 2>/dev/null
     grep -E '^SUPERTONIC_(UPSTREAM|SIMA)_HF_REVISION=|^[0-9a-f]{64}  supertonic-3' "${EXAMPLE_DIR}/setup.sh" 2>/dev/null
   } | sha256sum | cut -d' ' -f1
 }

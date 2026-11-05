@@ -70,6 +70,16 @@ from cli_think_suite import (  # noqa: E402,F401
     ThinkSplitterTests as CliThinkSplitterTests,
 )
 from asr_metadata_suite import AsrMetadataTests  # noqa: E402,F401
+from supertonic_platform3_suite import (  # noqa: E402,F401
+    BatchAxisTests as SupertonicBatchAxisTests,
+    ModelAssetsTests as SupertonicModelAssetsTests,
+    NumpyPinTests as SupertonicNumpyPinTests,
+    PyneatLinkTests as SupertonicPyneatLinkTests,
+)
+from paired_package_suite import (  # noqa: E402,F401
+    PairedPackageManagerTests,
+    PairedPackageTests,
+)
 from audio_api_suite import (  # noqa: E402,F401
     FormatTranscriptionTests as AudioApiFormatTranscriptionTests,
     SpeechRequestTests as AudioApiSpeechRequestTests,

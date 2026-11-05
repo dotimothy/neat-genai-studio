@@ -21,7 +21,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - environment check
     ) from exc
 
 from server.model_manager import ModelManager, _is_mla_failure
-from shared.config import HubConfig, model_dir_complete, model_dir_supported
+from shared.config import HubConfig, classify_model_dir, model_dir_complete
 
 
 class FakeServer:
@@ -504,13 +504,13 @@ class EncoderLayoutIsNotJudgedLocallyTests(unittest.TestCase):
 
     def test_a_combined_encoder_build_is_offered(self):
         d = self._build(self.tmp, "combined", ["m_encoder_stage1_mla.elf"])
-        self.assertEqual(model_dir_supported(d), (True, ""))
+        self.assertEqual(classify_model_dir(d)["type"], "asr")
         self.assertEqual(model_dir_complete(d), (True, ""))
 
     def test_a_layered_encoder_build_is_offered(self):
         d = self._build(self.tmp, "layered",
                         [f"m_encoder_layer{i}_stage1_mla.elf" for i in range(12)])
-        self.assertEqual(model_dir_supported(d), (True, ""))
+        self.assertEqual(classify_model_dir(d)["type"], "asr")
         self.assertEqual(model_dir_complete(d), (True, ""))
 
     def test_a_genuinely_broken_download_is_still_caught(self):

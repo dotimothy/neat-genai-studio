@@ -18,7 +18,7 @@
 | Languages | Python |
 | Status | stable |
 | Binary Name | neat-genai-studio |
-| Model | Loaded on demand (e.g. Qwen3-VL-4B-Instruct-GPTQ-a16w4) + whisper-small-a16w8 |
+| Model | Loaded on demand (e.g. Qwen3-VL-4B-Instruct-Autoround-a16w4) + whisper-small-a16w8 |
 
 ## Concept
 Runs supported language and vision-language models on a Modalix device through a web interface for chat, image analysis, model setup, and diagnostics.
@@ -133,8 +133,7 @@ as `config.local.yaml.bak` so any other hand edits can be copied back.
 chat model loaded. Download one from the Hugging Face panel or seed the
 catalog during installation, as shown below. By default, `setup.sh` downloads only:
 
-- `florianvoss/whisper-small-a16w8-layered-encoder` (ASR; stored as
-  `florianvoss@whisper-small-a16w8-layered-encoder`)
+- `simaai/whisper-small-a16w8` (ASR; stored as `whisper-small-a16w8`)
 - `thenlper/gte-small` (RAG embedding)
 
 Downloaded models are stored under `/media/nvme/llima/models` by default. That
@@ -158,14 +157,11 @@ Other useful environment variables:
 - `CHAT_MODEL_REPO`: optionally download **and preload** one chat/VLM model at
   startup (empty by default, i.e. none).
 - `ASR_MODEL_REPO`: the speech-to-text model installed and made active at
-  startup (default `florianvoss/whisper-small-a16w8-layered-encoder`; set to
-  `""` to install none). Current LLiMa splits the Whisper encoder into one ELF
-  per layer and refuses the older monolithic builds; on a runtime that needs a
-  monolithic encoder pass `ASR_MODEL_REPO=simaai/whisper-small-a16w8`. Setup
-  checks the model loads and leaves it out of the startup configuration if the
+  startup (default `simaai/whisper-small-a16w8`; set to `""` to install
+  none). Setup checks the model loads and leaves it out of the startup configuration if the
   runtime refuses it, rather than configuring a model that cannot be used.
 - `ASR_CATALOG_MODEL_REPOS`: space-separated extra ASR repos to seed the
-  catalog, e.g. `florianvoss/whisper-medium-a16w8-layered-encoder`, so you can
+  catalog, e.g. `simaai/whisper-medium-a16w8`, so you can
   switch between them
   at runtime from **Settings → Models**.
 - `MAX_RESIDENT_CHAT_MODELS`: how many chat/VLM models stay loaded together
@@ -209,13 +205,13 @@ server:
     max_resident_chat_models: 1             # chat/VLM models resident at once
     chat: []                                # optional: none preloaded by default.
       # To preload a model at startup instead, list it here, e.g.:
-      # - name: Qwen3-VL-4B-Instruct-GPTQ-a16w4
-      #   path: /media/nvme/llima/models/Qwen3-VL-4B-Instruct-GPTQ-a16w4
+      # - name: Qwen3-VL-4B-Instruct-Autoround-a16w4
+      #   path: /media/nvme/llima/models/Qwen3-VL-4B-Instruct-Autoround-a16w4
     asr:                                    # active at startup; switchable at runtime
       # What a default ./setup.sh installs. A repo from an account other than
       # simaai is stored as "<org>@<name>", which is the name to use here.
-      name: florianvoss@whisper-small-a16w8-layered-encoder
-      path: /media/nvme/llima/models/florianvoss@whisper-small-a16w8-layered-encoder
+      name: whisper-small-a16w8
+      path: /media/nvme/llima/models/whisper-small-a16w8
       # On a runtime that needs a monolithic encoder instead, install with
       # ASR_MODEL_REPO=simaai/whisper-small-a16w8 and use:
       #   name: whisper-small-a16w8
@@ -670,16 +666,16 @@ same slot. Exactly one is active — marked `● active` — and pressing **Use*
 another evicts it and makes the new one active, without restarting and without
 clearing the conversation. The chat model stays loaded throughout.
 
-`setup.sh` installs `florianvoss/whisper-small-a16w8-layered-encoder` by
-default — a layered-encoder build, which is what current LLiMa requires. To
-install a different or additional model:
+`setup.sh` installs `simaai/whisper-small-a16w8` by default, from SiMa's
+[speech and audio collection](https://huggingface.co/collections/simaai/speech-and-audio-models).
+To install a different or additional model:
 
 ```bash
 # Replace the default:
-ASR_MODEL_REPO="florianvoss/whisper-medium-a16w8-layered-encoder" ./setup.sh
+ASR_MODEL_REPO="simaai/whisper-medium-a16w8" ./setup.sh
 
 # Or keep whisper-small and seed extra models to switch between at runtime:
-ASR_CATALOG_MODEL_REPOS="florianvoss/whisper-medium-a16w8-layered-encoder" ./setup.sh
+ASR_CATALOG_MODEL_REPOS="simaai/whisper-medium-a16w8" ./setup.sh
 ```
 
 You can also download any Whisper build from **Settings → Add Model** while the
@@ -1053,7 +1049,7 @@ curl -s http://127.0.0.1:9997/control/max_resident \
 # re-selects as "configuredAsrModel".
 curl -s http://127.0.0.1:9997/control/asr \
   -H 'Content-Type: application/json' \
-  -d '{"name":"florianvoss@whisper-medium-a16w8-layered-encoder"}' | python3 -m json.tool
+  -d '{"name":"whisper-medium-a16w8"}' | python3 -m json.tool
 ```
 
 Check text chat:

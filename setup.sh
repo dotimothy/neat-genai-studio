@@ -18,19 +18,14 @@ CHAT_MODEL_REPO="${CHAT_MODEL_REPO:-}"
 CATALOG_MODEL_REPOS="${CATALOG_MODEL_REPOS:-}"
 # Speech-to-text model downloaded and made active at startup.
 #
-# A LAYERED-encoder build: current LLiMa splits the Whisper encoder into one ELF
-# per layer and rejects the older monolithic builds as "Unsupported legacy
-# Whisper model". Move this to the simaai layered build once published; on an
-# older runtime that needs a monolithic encoder, pass
-# ASR_MODEL_REPO=simaai/whisper-small-a16w8 instead. Setup checks the model
-# actually loads and will not configure it at startup if the runtime refuses it.
+# Official Whisper builds: https://huggingface.co/collections/simaai/speech-and-audio-models
 #
 # Set ASR_MODEL_REPO="" to install none (note the `-`, not `:-`, so an
 # explicitly empty value is honoured rather than falling back to the default).
-ASR_MODEL_REPO="${ASR_MODEL_REPO-florianvoss/whisper-small-a16w8-layered-encoder}"
+ASR_MODEL_REPO="${ASR_MODEL_REPO-simaai/whisper-small-a16w8}"
 # Extra ASR models to seed the catalog (space-separated HF repos); switch
 # between them at runtime in Settings -> Models. Example:
-#   ASR_CATALOG_MODEL_REPOS="florianvoss/whisper-medium-a16w8-layered-encoder"
+#   ASR_CATALOG_MODEL_REPOS="simaai/whisper-medium-a16w8 simaai/whisper-large-v3-turbo-a16w8"
 ASR_CATALOG_MODEL_REPOS="${ASR_CATALOG_MODEL_REPOS:-}"
 RAG_EMBEDDING_REPO="thenlper/gte-small"
 CHAT_MODEL_NAME="${CHAT_MODEL_NAME:-${CHAT_MODEL_REPO##*/}}"
@@ -125,6 +120,36 @@ catalog_dir_name() {
   else
     printf '%s@%s\n' "${org}" "${name}"
   fi
+}
+
+# A Hugging Face download, retried when the Hub rate-limits (429), answers with
+# a server error or drops the connection; any other failure, such as a wrong or
+# gated repo, stops at once. The hf CLI resumes a partial file, so a retry
+# continues where the last attempt stopped (#599).
+hf_download() {   # hf_download <hf executable> <arguments of `hf download`...>
+  local hf="$1" attempt=1 attempts=4 wait=15 log
+  shift
+  log="$(mktemp)"
+  while true; do
+    # The downloaded path stays on stdout; hf's messages show as they come and
+    # are kept to tell a passing failure from a lasting one.
+    if { "${hf}" download "$@" 2>&1 1>&3 | tee "${log}" >&2; } 3>&1; then
+      rm -f "${log}"
+      return 0
+    fi
+    # Only unindented lines: hf prints a traceback whose indented source lines
+    # (timeout=..., ConnectionError handlers) would match on any failure.
+    # LocalEntryNotFoundError is how hf reports a 429, a 5xx or no connection;
+    # SSLError, an HTTPS connection dropped mid-transfer.
+    if (( attempt >= attempts )) || ! awk '/^[^ \t]/ && /(LocalEntryNotFoundError|429 Client Error|Too Many Requests|[0-9][0-9][0-9] Server Error|ConnectionError|SSLError|ConnectTimeout|ReadTimeout|Connection reset|IncompleteRead|ChunkedEncodingError)/ { found = 1 } END { exit !found }' "${log}"; then
+      rm -f "${log}"
+      return 1
+    fi
+    warn "Hugging Face download of $1 failed (attempt ${attempt} of ${attempts}); retrying in ${wait}s…"
+    sleep "${wait}"
+    attempt=$((attempt + 1))
+    wait=$((wait * 2))
+  done
 }
 
 write_repo_marker() {
@@ -285,7 +310,7 @@ resolve_supertonic_paths
 
 # Supertonic 3: hybrid TTS whose vector field and vocoder run on the MLA through
 # PyNeat. The runtime package is vendored in src/python/ui/supertonic_sima/; its
-# dependencies (pyneat, onnxruntime, numpy 1.26) cannot share the UI venv, so an
+# dependencies (pyneat, onnxruntime, PyNeat's numpy) cannot share the UI venv, so an
 # isolated venv is built here and the model files are downloaded from Hugging
 # Face at pinned revisions and verified by checksum. The UI talks to it through
 # supertonic_worker.py. Optional: a failure here only leaves the CPU engines in
@@ -309,12 +334,12 @@ b76cbf62bac707c710cf0ae5aba5e31eea1a6339a9734bfae33ab98499534a50  supertonic-3/v
 ea1ac35ccb91b0d7ecad533a2fbd0eec10c91513d8951e3b25fbba99954e159b  supertonic-3/voice_styles/M3.json
 ca8eefad4fcd989c9379032ff3e50738adc547eeb5e221b82593a6d7b3bac303  supertonic-3/voice_styles/M4.json
 dd22b92740314321f8ae11c5e87f8dd60d060f15dd3a632b5adf77f471f77af2  supertonic-3/voice_styles/M5.json
-2f6b8c918e0c402453e48bd2686dbea429e6ce1dd98151c940d88229980e8dd2  supertonic-3-sima/supertonic_vector_field_sima_mpk.tar.gz
-90b2d6a089c8527826dd1d0cb5b557316ac703045f422d6e1332deeabd84e0cb  supertonic-3-sima/supertonic_vocoder_sima_bf16_mpk.tar.gz
-4e9a4d85592f720c9a497cf94164290ccdddd0c5d104577fb810c936d2abf9f9  supertonic-3-sima/supertonic_runtime_data.npz
-31285c6d2ed7c1bca84a78c6b3477edc0ac9f0442a8062adc2627574555a4e3e  supertonic-3-sima/artifact_manifest.json
-1659e891f4da0cc80c6dd7a5fbb3ca87f3a12ad7f0f2bce0bfb0963433709628  supertonic-3-sima/vocoder_bf16_manifest.json
 SUMS
+  python3 - "${EXAMPLE_DIR}/src/python/ui/supertonic_sima/model_assets.json" <<'PYASSETS'
+import json, sys
+for asset in json.load(open(sys.argv[1])).values():
+    print(f"{asset['sha256']}  supertonic-3-sima/{asset['file']}")
+PYASSETS
 }
 
 # Files that are missing or do not match their pinned checksum (one per line,
@@ -375,21 +400,64 @@ _local_pyneat_wheel() {
   return 1
 }
 
-_supertonic_venv() {
-  # The PyNeat wheel comes from sima-cli, which the DevKit exposes on PATH only
-  # for login shells.
-  if ! command -v sima-cli >/dev/null 2>&1 && [[ -x /data/sima-cli/.venv/bin/sima-cli ]]; then
-    export PATH="${PATH}:/data/sima-cli/.venv/bin"
+# Platform 3.0 installs PyNeat into the Neat environment (PYNEAT_PYTHON,
+# ~/pyneat) and sima-cli no longer provides a wheel. When that environment runs
+# the same Python version as the Supertonic venv, link the installed pyneat
+# distribution (its top-level entries from RECORD plus its .dist-info) into the
+# venv: the worker then runs exactly the installed runtime while the venv keeps
+# its own numpy and onnxruntime pins.
+_link_installed_pyneat() {
+  local target venv_version listing path
+  target="$("${SUPERTONIC_VENV}/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null)" \
+    || return 1
+  venv_version="$("${SUPERTONIC_VENV}/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])')" || return 1
+  listing="$("${PYNEAT_PYTHON}" - "${venv_version}" <<'PY' 2>/dev/null
+import sys
+from importlib.metadata import distribution
+from pathlib import Path
+if "%d.%d" % sys.version_info[:2] != sys.argv[1]:
+    raise SystemExit(1)
+dist = distribution("pyneat")
+root = Path(dist.locate_file(""))
+top = {f.parts[0] for f in dist.files or () if f.parts and f.parts[0] not in ("..", "bin")}
+for name in sorted(top):
+    if (root / name).exists():
+        print(root / name)
+PY
+)" || return 1
+  [[ -n "${listing}" ]] || return 1
+  local -a links=()
+  local link
+  while IFS= read -r path; do
+    link="${target}/$(basename "${path}")"
+    links+=("${link}")
+    ln -sfn "${path}" "${link}" || break
+  done <<<"${listing}"
+  _supertonic_runtime_ok && return 0
+  # Remove the links again so a later wheel install cannot write through them
+  # into the Neat environment.
+  rm -f "${links[@]}"
+  return 1
+}
+
+_find_sima_cli() {
+  # The DevKit puts sima-cli on PATH only for login shells, so setup.sh run over
+  # ssh, or from another script, would not see it.
+  local venv_bin="${SIMA_CLI_VENV_BIN:-/data/sima-cli/.venv/bin}"
+  if ! command -v sima-cli >/dev/null 2>&1 && [[ -x "${venv_bin}/sima-cli" ]]; then
+    export PATH="${PATH}:${venv_bin}"
   fi
+  command -v sima-cli >/dev/null 2>&1
+}
+
+_supertonic_venv() {
+  # The PyNeat wheel comes from sima-cli.
+  _find_sima_cli || true
   local want_version wheel_override="${PYNEAT_WHEEL}"
   want_version="$(_installed_pyneat_version)"
   if [[ -z "${wheel_override}" && -n "${want_version}" ]]; then
     wheel_override="$(_local_pyneat_wheel "${want_version}" || true)"
     [[ -n "${wheel_override}" ]] && info "Using the PyNeat wheel matching the installed runtime (${want_version})."
-  fi
-  if [[ -z "${wheel_override}" ]] && ! command -v sima-cli >/dev/null 2>&1; then
-    warn "sima-cli is required to fetch the PyNeat wheel for Supertonic; Supertonic TTS skipped."
-    return 1
   fi
   step "Creating isolated Supertonic venv: ${C_DIM}${SUPERTONIC_VENV}${C_RESET}"
   python3 -m venv --clear "${SUPERTONIC_VENV}" \
@@ -400,6 +468,10 @@ _supertonic_venv() {
   "${SUPERTONIC_VENV}/bin/python" -m pip install -r "${EXAMPLE_DIR}/src/python/requirements-supertonic.txt" \
     || _supertonic_venv_failed "Supertonic requirements failed to install; Supertonic TTS skipped." || return 1
   local wheel_dir status=0
+  if [[ -z "${PYNEAT_WHEEL}" ]] && _link_installed_pyneat; then
+    ok "Supertonic venv ready (PyNeat ${want_version:-unknown} linked from ${PYNEAT_PYTHON})."
+    return 0
+  fi
   if [[ -n "${wheel_override}" ]]; then
     # --no-deps: the wheel must not move the pinned numpy/onnxruntime.
     "${SUPERTONIC_VENV}/bin/python" -m pip install --no-deps "${wheel_override}" \
@@ -437,6 +509,47 @@ _supertonic_venv() {
   ok "Supertonic venv ready."
 }
 
+# Both compiled MLA models come from the SiMa model zoo. The worker and
+# installer share their filenames and checksums in model_assets.json.
+_supertonic_mla_models() {
+  local pin="${EXAMPLE_DIR}/src/python/ui/supertonic_sima/model_assets.json"
+  local dir="${SUPERTONIC_MODELS_ROOT}/supertonic-3-sima" entries component url sum file target tmp
+  entries="$(python3 - "${pin}" <<'PYASSETS'
+import json, sys
+assets = json.load(open(sys.argv[1]))
+for name in ("vector_estimator", "vocoder"):
+    asset = assets[name]
+    print("\t".join((name, asset["url"], asset["sha256"], asset["file"])))
+PYASSETS
+)" || return 1
+  mkdir -p "${dir}" || return 1
+  while IFS=$'\t' read -r component url sum file; do
+    target="${dir}/${file}"
+    if [[ -f "${target}" && "$(sha256sum "${target}" | cut -d' ' -f1)" == "${sum}" ]]; then
+      ok "Supertonic ${component} already downloaded."
+      continue
+    fi
+    if ! _find_sima_cli; then
+      warn "sima-cli is needed to download Supertonic's compiled models."
+      return 1
+    fi
+    step "Downloading Supertonic ${component} from the SiMa model zoo…"
+    tmp="$(mktemp -d "${SUPERTONIC_MODELS_ROOT}/.supertonic-model.XXXXXX")" || return 1
+    if ! sima-cli download "${url}" -d "${tmp}"; then
+      rm -rf "${tmp}"
+      warn "The model zoo download failed; rerun setup.sh to retry."
+      return 1
+    fi
+    if [[ "$(sha256sum "${tmp}/${url##*/}" | cut -d' ' -f1)" != "${sum}" ]]; then
+      rm -rf "${tmp}"
+      warn "Supertonic ${component} checksum mismatch."
+      return 1
+    fi
+    mv -f "${tmp}/${url##*/}" "${target}" || { rm -rf "${tmp}"; return 1; }
+    rm -rf "${tmp}"
+  done <<< "${entries}"
+}
+
 _supertonic_models() {
   local hf="${SUPERTONIC_VENV}/bin/hf"
   if [[ ! -x "${hf}" ]]; then
@@ -445,17 +558,14 @@ _supertonic_models() {
   fi
   mkdir -p "${SUPERTONIC_MODELS_ROOT}" || return 1
   export HF_HOME="${SUPERTONIC_MODELS_ROOT}/.hf-cache"   # keep the cache off the root filesystem
-  step "Downloading the compiled MLA packages (${SUPERTONIC_SIMA_HF_REPO}@${SUPERTONIC_SIMA_HF_REVISION:0:12})…"
-  "${hf}" download "${SUPERTONIC_SIMA_HF_REPO}" \
-    supertonic_vector_field_sima_mpk.tar.gz \
-    supertonic_vocoder_sima_bf16_mpk.tar.gz \
+  step "Downloading the runtime constants (${SUPERTONIC_SIMA_HF_REPO}@${SUPERTONIC_SIMA_HF_REVISION:0:12})…"
+  hf_download "${hf}" "${SUPERTONIC_SIMA_HF_REPO}" \
     supertonic_runtime_data.npz \
-    artifact_manifest.json \
-    vocoder_bf16_manifest.json \
     --revision "${SUPERTONIC_SIMA_HF_REVISION}" \
     --local-dir "${SUPERTONIC_MODELS_ROOT}/supertonic-3-sima" || return 1
+  _supertonic_mla_models || return 1
   step "Downloading the upstream CPU models and voice styles (${SUPERTONIC_UPSTREAM_HF_REPO}@${SUPERTONIC_UPSTREAM_HF_REVISION:0:12})…"
-  "${hf}" download "${SUPERTONIC_UPSTREAM_HF_REPO}" \
+  hf_download "${hf}" "${SUPERTONIC_UPSTREAM_HF_REPO}" \
     onnx/duration_predictor.onnx onnx/text_encoder.onnx onnx/tts.json onnx/unicode_indexer.json \
     voice_styles/F1.json voice_styles/F2.json voice_styles/F3.json voice_styles/F4.json voice_styles/F5.json \
     voice_styles/M1.json voice_styles/M2.json voice_styles/M3.json voice_styles/M4.json voice_styles/M5.json \
@@ -489,9 +599,22 @@ _supertonic_refresh_requirements() {
 # file against its pinned checksum, re-fetching anything missing or different.
 # `refresh` (dependency-only mode) also re-applies the pins to a usable venv.
 # Always returns 0: Supertonic is optional and the CPU engines remain.
+# The board's platform version (DISTRO_VERSION in /etc/buildinfo), or nothing
+# when it cannot be read, for example off the board.
+_platform_version() {
+  sed -n 's/^DISTRO_VERSION *= *//p' "${SIMA_BUILDINFO:-/etc/buildinfo}" 2>/dev/null | head -n1
+}
+
 install_supertonic() {
-  local refresh="${1:-}"
+  local refresh="${1:-}" platform
   section "Supertonic 3 (MLA text-to-speech)"
+  # The vector estimator pinned here is the Platform 3.0 compile; older Core
+  # rejects it. Leave an older board's Supertonic files untouched.
+  platform="$(_platform_version)"
+  if [[ -n "${platform}" && "${platform%%.*}" =~ ^[0-9]+$ && "${platform%%.*}" -lt 3 ]]; then
+    warn "Supertonic needs Platform 3.0 or newer (this board: ${platform}); skipped. The CPU TTS engines remain available."
+    return 0
+  fi
   if _supertonic_runtime_ok; then
     if [[ "${refresh}" == "refresh" ]] && ! _supertonic_refresh_requirements; then
       _supertonic_venv || return 0
@@ -570,7 +693,7 @@ section "Models"
 if [[ "${SKIP_MODEL_DOWNLOAD}" != "1" ]]; then
   if [[ -n "${CHAT_MODEL_REPO}" ]]; then
     step "Downloading chat/VLM model: ${CHAT_MODEL_REPO}"
-    "${APP_VENV}/bin/hf" download "${CHAT_MODEL_REPO}" --local-dir "${CHAT_MODEL_DIR}"
+    hf_download "${APP_VENV}/bin/hf" "${CHAT_MODEL_REPO}" --local-dir "${CHAT_MODEL_DIR}"
     write_repo_marker "${CHAT_MODEL_REPO}" "${CHAT_MODEL_DIR}"
   else
     info "No default chat/VLM model — download one from the UI (or set CHAT_MODEL_REPO)."
@@ -578,7 +701,7 @@ if [[ "${SKIP_MODEL_DOWNLOAD}" != "1" ]]; then
 
   if [[ -n "${ASR_MODEL_REPO}" ]]; then
     step "Downloading ASR model: ${ASR_MODEL_REPO}"
-    "${APP_VENV}/bin/hf" download "${ASR_MODEL_REPO}" --local-dir "${ASR_MODEL_DIR}"
+    hf_download "${APP_VENV}/bin/hf" "${ASR_MODEL_REPO}" --local-dir "${ASR_MODEL_DIR}"
     write_repo_marker "${ASR_MODEL_REPO}" "${ASR_MODEL_DIR}"
   else
     info "No default ASR model — download one from the UI (or set ASR_MODEL_REPO)."
@@ -587,17 +710,17 @@ if [[ "${SKIP_MODEL_DOWNLOAD}" != "1" ]]; then
   for repo in ${ASR_CATALOG_MODEL_REPOS}; do
     name="$(catalog_dir_name "${repo}")"
     step "Downloading ASR catalog model: ${repo}"
-    "${APP_VENV}/bin/hf" download "${repo}" --local-dir "${MODELS_DIR}/${name}"
+    hf_download "${APP_VENV}/bin/hf" "${repo}" --local-dir "${MODELS_DIR}/${name}"
     write_repo_marker "${repo}" "${MODELS_DIR}/${name}"
   done
 
   step "Downloading RAG embedding model: ${RAG_EMBEDDING_REPO}"
-  "${APP_VENV}/bin/hf" download "${RAG_EMBEDDING_REPO}" --local-dir "${RAG_EMBEDDING_DIR}"
+  hf_download "${APP_VENV}/bin/hf" "${RAG_EMBEDDING_REPO}" --local-dir "${RAG_EMBEDDING_DIR}"
 
   for repo in ${CATALOG_MODEL_REPOS}; do
     name="$(catalog_dir_name "${repo}")"
     step "Downloading catalog model: ${repo}"
-    "${APP_VENV}/bin/hf" download "${repo}" --local-dir "${MODELS_DIR}/${name}"
+    hf_download "${APP_VENV}/bin/hf" "${repo}" --local-dir "${MODELS_DIR}/${name}"
     write_repo_marker "${repo}" "${MODELS_DIR}/${name}"
   done
   ok "Model downloads complete."
@@ -651,8 +774,7 @@ if [[ -n "${ASR_MODEL_REPO}" && "${SKIP_MODEL_DOWNLOAD}" != "1" ]]; then
        warn "This runtime refuses ${ASR_MODEL_NAME}:"
        printf '%s\n' "${probe_out}" | sed 's/^/    /' >&2
        warn "Leaving it in the catalog but NOT configuring it at startup."
-       warn "Install one this runtime accepts, e.g. ASR_MODEL_REPO=simaai/whisper-small-a16w8 ./setup.sh,"
-       warn "or pick a model in Settings -> Models once the Studio is running." ;;
+       warn "Check model/runtime compatibility, or pick a model in Settings -> Models once the Studio is running." ;;
     *) warn "Could not verify ${ASR_MODEL_NAME} (accelerator busy or no runtime); configuring it anyway." ;;
   esac
 fi
