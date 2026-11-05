@@ -58,6 +58,9 @@ All captures below come from a Modalix DevKit running the Studio, with `gemma-4-
 The photo in the vision demo is NASA's Apollo 17 view of Earth (AS17-148-22727, public domain).
 
 ## Prerequisites
+- A Modalix DevKit on **Platform 3.0.0** (Palette SDK 3.0.0.0) with Neat
+  Library v0.6.0 and LLiMa 0.6.0 installed (`sima-cli neat install core@v0.6.0`).
+  Boards still on Platform 2.1.3 need an earlier version of the Studio.
 - Installed Neat Development Environment + Neat Library.
 - The model server uses the Python environment where `pyneat` is available. The default scripts assume:
 
@@ -854,20 +857,23 @@ selector in Settings.
   language (a few seconds) and other languages load on their first spoken
   reply. Without Supertonic every installed engine loads at startup as before.
 - **Supertonic runs in its own venv and worker too.** Its runtime needs `pyneat`,
-  `onnxruntime` and `numpy 1.26`, which the UI venv does not carry, so `setup.sh`
-  builds `./.venv-supertonic` (requirements in
-  `src/python/requirements-supertonic.txt`, plus the PyNeat wheel fetched with
-  `sima-cli neat install core -t pyneat`) and downloads the model files with
-  the venv's `hf`: the upstream CPU models and voice styles from
+  `onnxruntime` and the numpy PyNeat is built against (2.2 on Platform 3.0),
+  which the UI venv does not carry, so `setup.sh` builds `./.venv-supertonic`
+  (requirements in `src/python/requirements-supertonic.txt`, with the PyNeat
+  installed in `~/pyneat` linked in, or a PyNeat wheel when the Python versions
+  differ). It downloads the upstream CPU models and voice styles from
   [Supertone/supertonic-3](https://huggingface.co/Supertone/supertonic-3) and
-  the precompiled MLA packages from
-  [florianvoss/supertonic-3-sima](https://huggingface.co/florianvoss/supertonic-3-sima),
-  both at commit revisions pinned in `setup.sh` and verified by SHA-256. No
+  the runtime constants from
+  [florianvoss/supertonic-3-sima](https://huggingface.co/florianvoss/supertonic-3-sima)
+  at commit revisions pinned in `setup.sh`, and the two models compiled for
+  Platform 3.0 from the SiMa model zoo with `sima-cli download` (pinned in
+  `src/python/ui/supertonic_sima/model_assets.json`), all verified by SHA-256.
+  On a board older than Platform 3.0, `setup.sh` skips Supertonic. No
   on-device compilation is needed, and nothing is cloned from an external
   repository: the runtime package itself is vendored in
   `src/python/ui/supertonic_sima/` (see its README for provenance and how to
   refresh it). Every `setup.sh` run (including `--dependencies-only`) checks all
-  19 model files against the SHA-256 of the pinned revisions and re-fetches any
+  17 model files against the SHA-256 of the pinned revisions and re-fetches any
   that are missing or different, so an interrupted, corrupted or outdated
   download is repaired; a venv whose build fails part-way is removed rather than
   left half-installed. The models root and the venv path are persisted under
