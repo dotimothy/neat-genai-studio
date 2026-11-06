@@ -5,11 +5,12 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+import os
 from unittest.mock import patch
 
 from asr_switching_suite import FakeServer, make_model_dir
 from server.model_manager import (MAX_RESIDENT_LIMIT, ModelManager,
-                                  mla_pool_bytes, mla_pool_regions)
+                                  mla_held_bytes, mla_pool_bytes, mla_pool_regions)
 from shared.config import HubConfig
 
 CHAT = ("model-a", "model-b", "model-c")
@@ -400,18 +401,54 @@ class MlaMemoryTests(ModelDirsCase):
             (self.tmp / name / "elf_files" / "stage0_mla.elf").write_bytes(b"x" * size)
             (self.tmp / name / "tokenizer.json").write_bytes(b"y" * 9999)   # not counted
         manager, _ = self.manager(2)
-        with patch("server.model_manager.mla_pool_regions", return_value=self.POOL):
+        with patch("server.model_manager.mla_pool_regions", return_value=self.POOL), \
+             patch("server.model_manager.mla_held_bytes", return_value=None):
             self.assertEqual(manager.mla_memory()["usedBytes"], 70)   # speech model only
             manager.load("model-a")
             manager.load("model-b")
             mla = manager.status()["mla"]
             self.assertEqual(mla["totalBytes"], 16 << 30)
-            self.assertIsNone(mla["claimedBytes"])   # no dispatcher map on Platform 3.0
+            self.assertIsNone(mla["claimedBytes"])   # /proc could not be read
             self.assertEqual(mla["models"], {"model-a": 3000, "model-b": 500, ASR: 70})
             self.assertEqual(mla["usedBytes"], 3570)
             self.assertTrue(mla["estimated"])
             manager.unload("model-a")
             self.assertEqual(manager.mla_memory()["usedBytes"], 570)
+
+    def fake_proc(self, procs):
+        """A /proc with {pid: [(target, fdinfo or None), ...]}."""
+        root = self.tmp / "proc"
+        for pid, fds in procs.items():
+            (root / pid / "fd").mkdir(parents=True)
+            (root / pid / "fdinfo").mkdir()
+            for n, (target, info) in enumerate(fds):
+                os.symlink(target, root / pid / "fd" / str(n))
+                if info is not None:
+                    (root / pid / "fdinfo" / str(n)).write_text(info)
+        (root / "self").mkdir()                       # not a pid: skipped
+        return root
+
+    @staticmethod
+    def buf(ino, size, exporter="simaai,dms"):
+        return ("/dmabuf:", f"pos:\t0\nflags:\t02000002\nino:\t{ino}\nsize:\t{size}\ncount:\t1\nexp_name:\t{exporter}\n")
+
+    def test_held_memory_counts_every_dms_buffer_once(self):
+        proc = self.fake_proc({
+            "100": [self.buf(1, 4096), self.buf(1, 4096), self.buf(2, 8192),   # fd 0 and 1 share a buffer
+                    self.buf(3, 1 << 20, "linux,cma"), ("/dev/null", None)],      # other heap, a plain file
+            "200": [self.buf(2, 8192), self.buf(4, 1 << 30)],                     # shares buffer 2 with 100
+            "300": [("/dmabuf:", None)],                                           # fdinfo not readable
+        })
+        self.assertEqual(mla_held_bytes(proc), 4096 + 8192 + (1 << 30))
+        self.assertIsNone(mla_held_bytes(self.tmp / "no-proc"))
+
+    def test_meter_reports_the_measured_figure(self):
+        manager, _ = self.manager(1)
+        with patch("server.model_manager.mla_pool_regions", return_value=self.POOL), \
+             patch("server.model_manager.mla_held_bytes", return_value=5 << 30) as held:
+            self.assertEqual(manager.mla_memory()["claimedBytes"], 5 << 30)
+            manager.mla_memory()
+        self.assertEqual(held.call_count, 1)          # cached between quick polls
 
     def test_unknown_pool_size_is_reported_as_none(self):
         manager, _ = self.manager(1)

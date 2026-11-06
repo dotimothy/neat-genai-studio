@@ -148,6 +148,49 @@ def mla_pool_bytes(base: Path = _RESERVED_MEMORY_DIR) -> int | None:
     return sum(size for _addr, size in mla_pool_regions(base)) or None
 
 
+# On Platform 3.0 every program allocates its accelerator memory itself, from
+# the DMS pool, as dma-bufs exported under this name.
+_MLA_DMABUF_EXPORTER = "simaai,dms"
+
+
+def mla_held_bytes(proc: Path = Path("/proc"), exporter: str = _MLA_DMABUF_EXPORTER) -> int | None:
+    """Pool memory held right now, board-wide: the size of every ``simaai,dms``
+    dma-buf any process has open, each buffer once (by inode) however many
+    descriptors or processes share it.
+
+    Measured, not estimated: it includes other programs on the accelerator and
+    memory a model left behind. Processes this user may not inspect (another
+    user's, without root) are not counted. None when ``/proc`` cannot be read.
+    """
+    try:
+        pids = [d for d in os.listdir(proc) if d.isdigit()]
+    except OSError:
+        return None
+    sizes: dict[str, int] = {}
+    for pid in pids:
+        fd_dir = proc / pid / "fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if not os.readlink(fd_dir / fd).startswith("/dmabuf"):
+                    continue
+                info = (proc / pid / "fdinfo" / fd).read_text()
+            except OSError:
+                continue
+            fields = dict(line.split(":", 1) for line in info.splitlines() if ":" in line)
+            if fields.get("exp_name", "").strip() != exporter:
+                continue
+            try:
+                size = int(fields.get("size", "0"))
+            except ValueError:
+                continue
+            sizes[fields.get("ino", "").strip() or f"{pid}/{fd}"] = size
+    return sum(sizes.values())
+
+
 _MLA_FAILURE_MARKERS = (
     "mla_load",
     "mla load",
@@ -220,6 +263,7 @@ class ModelManager:
         self._catalog: dict[str, dict] = {}
         # The accelerator's memory pool (read once on first use).
         self._mla_regions: list[tuple[int, int]] | None = None
+        self._mla_held_cache: tuple[float, int | None] = (-1e9, None)
         # On-disk weight size per model dir (cached; dirs are static once present).
         self._size_cache: dict[str, int] = {}
         # Weight-completeness per model dir (cached; cleared on each rescan).
@@ -561,12 +605,13 @@ class ModelManager:
             del self._lost[:-10]
 
     def mla_memory(self) -> dict:
-        """Accelerator memory: the pool's size and an estimate of what the
-        models loaded here take up.
+        """Accelerator memory: the pool's size, how much of it is held, and an
+        estimate of what the models loaded here take up.
 
-        ``claimedBytes`` is always None on Platform 3.0: the runtime drives the
-        MLA from this process, and there is no longer a dispatcher whose memory
-        map shows what the whole board holds. Clients show the estimate.
+        ``claimedBytes`` is measured, board-wide: every ``simaai,dms`` dma-buf
+        open on the board (see ``mla_held_bytes``), which is what decides
+        whether another model fits. It includes other programs on the
+        accelerator. None when the pool or ``/proc`` cannot be read.
 
         ``usedBytes`` / ``models`` are an estimate: the size of each loaded
         model's ELF stages, which is what gets transferred to the accelerator.
@@ -582,11 +627,21 @@ class ModelManager:
                 models[name] = size
         return {
             "totalBytes": total or None,
-            "claimedBytes": None,
+            "claimedBytes": self._mla_held() if total else None,
             "usedBytes": sum(models.values()),
             "models": models,
             "estimated": True,
         }
+
+    def _mla_held(self) -> int | None:
+        """``mla_held_bytes``, cached briefly: the meter polls every couple of
+        seconds and status about once a second during a load."""
+        now = time.monotonic()
+        at, value = self._mla_held_cache
+        if now - at >= 1.5:
+            value = mla_held_bytes()
+            self._mla_held_cache = (now, value)
+        return value
 
     def set_max_resident(self, limit) -> dict:
         """Change how many chat/VLM models may be resident at once.
