@@ -9,7 +9,6 @@
 # All rights reserved.
 #########################################################
 import base64
-import hmac
 import ipaddress
 import json
 import logging
@@ -2111,52 +2110,6 @@ class AppContext:
             return Response(resp.content, status=resp.status_code,
                             mimetype='application/json')
 
-        @self.app.route('/models/reset-mla', methods=['POST'])
-        def models_reset_mla():
-            # Board-wide operation on a network-exposed, login-less UI. Off by
-            # default; with STUDIO_RESET_AUTH=1 any client that is not on the
-            # board must send the token run.sh printed. The cross-origin guard
-            # above only covers browser-originated requests, so it is not an
-            # authorization boundary for this route.
-            if os.environ.get('STUDIO_RESET_AUTH', '0') == '1':
-                expected = os.environ.get('STUDIO_RESET_TOKEN', '')
-                provided = request.headers.get('X-Reset-Token', '')
-                on_board = request.remote_addr in ('127.0.0.1', '::1')
-                if not on_board and not (expected and hmac.compare_digest(provided, expected)):
-                    return jsonify({
-                        'error': 'Reset MLA needs the reset token that run.sh printed '
-                                 'at startup (X-Reset-Token header).',
-                        'auth': 'reset-token',
-                    }), 401
-            # The server exits ~1.5s after replying, so the response may not
-            # arrive at all — a dropped connection here is success, not failure.
-            # A server wedged inside a native model load is different: it
-            # accepts the connection but never answers (the GIL is held), so the
-            # request times out. That is exactly the case the button exists for,
-            # and only the supervisor (run.sh) can recover it: ask it through the
-            # request file it polls.
-            if os.environ.get('MLA_RESET', '1') != '1':
-                return jsonify({'error': 'Accelerator reset is disabled (MLA_RESET=0).'}), 400
-            try:
-                resp = requests.post(_control_url('/control/reset_mla'), timeout=10)
-            except requests.Timeout:
-                request_file = os.environ.get('NEAT_RESET_REQUEST_FILE', '')
-                if not request_file:
-                    return jsonify({'error': 'The model server is not responding and no '
-                                             'supervisor is available to reset it '
-                                             '(start the Studio with run.sh).'}), 503
-                try:
-                    Path(request_file).write_text('reset\n', encoding='utf-8')
-                except OSError as exc:
-                    logging.error("Could not write the reset request file %s: %s", request_file, exc)
-                    return jsonify({'error': 'Could not hand the reset to the supervisor.'}), 500
-                logging.warning("Model server unresponsive; reset handed to the supervisor")
-                return jsonify({'state': 'resetting', 'reset': True, 'via': 'supervisor'}), 202
-            except requests.RequestException:
-                return jsonify({'state': 'resetting', 'reset': True}), 202
-            return Response(resp.content, status=resp.status_code,
-                            mimetype='application/json')
-
         @self.app.route('/models/unload', methods=['POST'])
         def models_unload():
             name = (request.get_json(silent=True) or {}).get('name', '')
@@ -2447,8 +2400,7 @@ class AppContext:
                 if selected_model not in loaded_now:
                     return jsonify({
                         'error': f"{selected_model} is no longer loaded. It was unloaded "
-                                 "outside this page (another session, the API, or an "
-                                 "accelerator reset). Load it again or pick another model.",
+                                 "outside this page (another session or the API). Load it again or pick another model.",
                         'code': 'model-not-loaded',
                         'model': selected_model,
                     }), 409

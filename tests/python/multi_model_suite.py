@@ -5,12 +5,12 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+import os
 from unittest.mock import patch
 
 from asr_switching_suite import FakeServer, make_model_dir
 from server.model_manager import (MAX_RESIDENT_LIMIT, ModelManager,
-                                  claimed_from_maps, mla_pool_bytes,
-                                  mla_pool_regions)
+                                  mla_held_bytes, mla_pool_bytes, mla_pool_regions)
 from shared.config import HubConfig
 
 CHAT = ("model-a", "model-b", "model-c")
@@ -285,47 +285,6 @@ class LoadedStateIsCheckedTests(ModelDirsCase):
             self.assertEqual(manager.verify_loaded()["lost"], [ASR])
         self.assertIsNone(manager.active_asr())
 
-    def test_an_outside_accelerator_reset_triggers_verification(self):
-        with patch("server.model_manager.dispatcher_identity", return_value=(100, 5)):
-            manager, _ = self.manager(2)
-            manager.load("model-a")
-            manager.load("model-b")
-            self.assertEqual(manager.residency()["lost"], [])      # same dispatcher: nothing to do
-        chat, asr = self.probes({"model-a": (False, "HTTP 500: mlashm"), "model-b": (False, "HTTP 500: mlashm")},
-                                asr=(False, "HTTP 500: mlashm"))
-        with patch("server.model_manager.dispatcher_identity", return_value=(222, 9)), \
-                patch("server.model_manager.threading.Thread", self.Inline), chat, asr:
-            status = manager.residency_status()
-        self.assertEqual(status["resident"], [])
-        self.assertEqual(status["loaded"], [])
-        self.assertEqual(sorted(l["name"] for l in status["lost"]), ["model-a", "model-b", ASR])
-        self.assertTrue(all("reset by another program" in l["reason"] for l in status["lost"]))
-        self.assertFalse(status["verifying"])
-
-    def test_models_that_survive_the_check_stay_loaded(self):
-        with patch("server.model_manager.dispatcher_identity", return_value=(100, 5)):
-            manager, _ = self.manager(1)
-            manager.load("model-a")
-        chat, asr = self.probes()
-        with patch("server.model_manager.dispatcher_identity", return_value=(222, 9)), \
-                patch("server.model_manager.threading.Thread", self.Inline), chat as probe, asr:
-            first = manager.residency_status()
-            manager.residency_status()                 # the new dispatcher is adopted: no re-check
-        self.assertEqual(first["resident"], ["model-a"])
-        self.assertEqual(first["lost"], [])
-        self.assertEqual(probe.call_count, 1)
-
-    def test_a_dispatcher_that_is_down_is_not_mistaken_for_a_reset(self):
-        with patch("server.model_manager.dispatcher_identity", return_value=(100, 5)):
-            manager, _ = self.manager(1)
-            manager.load("model-a")
-        chat, asr = self.probes()
-        with patch("server.model_manager.dispatcher_identity", return_value=None), \
-                patch("server.model_manager.threading.Thread", self.Inline), chat as probe, asr:
-            self.assertEqual(manager.residency_status()["resident"], ["model-a"])
-        self.assertEqual(probe.call_count, 0)
-
-
 class UnloadTimingTests(ModelDirsCase):
     """Unloads are timed so clients can show progress for the next one."""
 
@@ -433,60 +392,63 @@ class MlaMemoryTests(ModelDirsCase):
         self.assertIsNone(mla_pool_bytes(self.tmp / "missing"))
 
     POOL = [(0x1300000000, 16 << 30)]
-    # The dispatcher's map on a DevKit: 512 MB slabs of the pool, a small pool
-    # buffer, one slab mapped twice, and mappings that are not pool memory.
-    MAPS = """\
-fffa80000000-fffaa0000000 rw-s 16c0000000 00:05 91 /dev/simaai-mem
-fffaa0000000-fffac0000000 rw-s 1680000000 00:05 91 /dev/simaai-mem
-fffb00000000-fffb20000000 rw-s 1680000000 00:05 91 /dev/simaai-mem
-fffac0000000-fffac0100000 rw-s 1300000000 00:05 91 /dev/simaai-mem
-fffad0000000-fffad0400000 rw-s 1000400000 00:05 91 /dev/simaai-mem
-ffff9a000000-ffff9a021000 rw-p 00000000 00:00 0 [heap]
-ffff9b000000-ffff9b200000 r-xp 00000000 b3:02 77 /usr/lib/aarch64-linux-gnu/libc.so.6
-"""
-
     def test_pool_regions_carry_the_address_too(self):
         base = self.reserved([("dms@0x1400000000", 0x1300000000, 16 << 30)])
         self.assertEqual(mla_pool_regions(base), self.POOL)
-
-    def test_claimed_counts_each_mapped_piece_of_the_pool_once(self):
-        # two 512 MB slabs + 1 MB; the repeat and the non-pool mappings do not count
-        self.assertEqual(claimed_from_maps(self.MAPS, self.POOL), (1024 + 1) << 20)
-        self.assertEqual(claimed_from_maps("", self.POOL), 0)
-        self.assertEqual(claimed_from_maps("not a maps line\n", self.POOL), 0)
-
-    def memory_patches(self, maps):
-        return (patch("server.model_manager.mla_pool_regions", return_value=self.POOL),
-                patch("server.model_manager.read_dispatcher_maps", return_value=maps))
 
     def test_usage_is_the_elf_size_of_what_is_loaded(self):
         for name, size in (("model-a", 3000), ("model-b", 500), (ASR, 70)):
             (self.tmp / name / "elf_files" / "stage0_mla.elf").write_bytes(b"x" * size)
             (self.tmp / name / "tokenizer.json").write_bytes(b"y" * 9999)   # not counted
         manager, _ = self.manager(2)
-        pool, maps = self.memory_patches(self.MAPS)
-        with pool, maps:
+        with patch("server.model_manager.mla_pool_regions", return_value=self.POOL), \
+             patch("server.model_manager.mla_held_bytes", return_value=None):
             self.assertEqual(manager.mla_memory()["usedBytes"], 70)   # speech model only
             manager.load("model-a")
             manager.load("model-b")
             mla = manager.status()["mla"]
             self.assertEqual(mla["totalBytes"], 16 << 30)
-            self.assertEqual(mla["claimedBytes"], (1024 + 1) << 20)
+            self.assertIsNone(mla["claimedBytes"])   # /proc could not be read
             self.assertEqual(mla["models"], {"model-a": 3000, "model-b": 500, ASR: 70})
             self.assertEqual(mla["usedBytes"], 3570)
             self.assertTrue(mla["estimated"])
             manager.unload("model-a")
             self.assertEqual(manager.mla_memory()["usedBytes"], 570)
 
-    def test_claimed_is_none_when_the_dispatcher_cannot_be_read(self):
+    def fake_proc(self, procs):
+        """A /proc with {pid: [(target, fdinfo or None), ...]}."""
+        root = self.tmp / "proc"
+        for pid, fds in procs.items():
+            (root / pid / "fd").mkdir(parents=True)
+            (root / pid / "fdinfo").mkdir()
+            for n, (target, info) in enumerate(fds):
+                os.symlink(target, root / pid / "fd" / str(n))
+                if info is not None:
+                    (root / pid / "fdinfo" / str(n)).write_text(info)
+        (root / "self").mkdir()                       # not a pid: skipped
+        return root
+
+    @staticmethod
+    def buf(ino, size, exporter="simaai,dms"):
+        return ("/dmabuf:", f"pos:\t0\nflags:\t02000002\nino:\t{ino}\nsize:\t{size}\ncount:\t1\nexp_name:\t{exporter}\n")
+
+    def test_held_memory_counts_every_dms_buffer_once(self):
+        proc = self.fake_proc({
+            "100": [self.buf(1, 4096), self.buf(1, 4096), self.buf(2, 8192),   # fd 0 and 1 share a buffer
+                    self.buf(3, 1 << 20, "linux,cma"), ("/dev/null", None)],      # other heap, a plain file
+            "200": [self.buf(2, 8192), self.buf(4, 1 << 30)],                     # shares buffer 2 with 100
+            "300": [("/dmabuf:", None)],                                           # fdinfo not readable
+        })
+        self.assertEqual(mla_held_bytes(proc), 4096 + 8192 + (1 << 30))
+        self.assertIsNone(mla_held_bytes(self.tmp / "no-proc"))
+
+    def test_meter_reports_the_measured_figure(self):
         manager, _ = self.manager(1)
-        pool, maps = self.memory_patches(None)
-        with pool, maps as reader:
-            first = manager.mla_memory()
+        with patch("server.model_manager.mla_pool_regions", return_value=self.POOL), \
+             patch("server.model_manager.mla_held_bytes", return_value=5 << 30) as held:
+            self.assertEqual(manager.mla_memory()["claimedBytes"], 5 << 30)
             manager.mla_memory()
-        self.assertIsNone(first["claimedBytes"])
-        self.assertEqual(first["totalBytes"], 16 << 30)
-        self.assertEqual(reader.call_count, 1)   # backs off instead of retrying each poll
+        self.assertEqual(held.call_count, 1)          # cached between quick polls
 
     def test_unknown_pool_size_is_reported_as_none(self):
         manager, _ = self.manager(1)
@@ -495,29 +457,21 @@ ffff9b000000-ffff9b200000 r-xp 00000000 b3:02 77 /usr/lib/aarch64-linux-gnu/libc
         self.assertIsNone(memory["totalBytes"])
         self.assertIsNone(memory["claimedBytes"])
 
-    def test_a_load_the_runtime_rejects_names_a_full_pool(self):
+    def test_a_load_the_runtime_rejects_names_what_is_still_loaded(self):
         manager, server = self.manager(2)
         manager.load("model-a")
-        full = "".join(
-            f"{0xfff000000000 + i * 0x20000000:x}-{0xfff000000000 + (i + 1) * 0x20000000:x} "
-            f"rw-s {0x1300000000 + i * 0x20000000:x} 00:05 91 /dev/simaai-mem\n"
-            for i in range(31))                       # 15.5 of 16 GiB
-        pool, maps = self.memory_patches(full)
 
         def refuse(path, name):
-            raise RuntimeError("Failed to bulk load model through MLASHM dispatcher")
+            raise RuntimeError("Cannot allocate memory")
 
-        with pool, maps, patch.object(server, "add_model", side_effect=refuse):
+        with patch.object(server, "add_model", side_effect=refuse):
             with self.assertRaises(RuntimeError) as caught:
                 manager.load("model-b")
         message = str(caught.exception)
-        self.assertIn("nearly full", message)
-        self.assertIn("15.5 of 16.0 GB", message)
-        self.assertIn("Reset MLA", message)
+        self.assertIn("Restart the Studio", message)
         self.assertIn("model-a", message)             # still loaded, and named
         self.assertEqual(manager.residency()["resident"], ["model-a"])
         self.assertEqual(manager.load_logs()["lastError"]["kind"], "mla")
-
 
 if __name__ == "__main__":
     unittest.main()

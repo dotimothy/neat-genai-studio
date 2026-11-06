@@ -18,7 +18,7 @@
 | Languages | Python |
 | Status | stable |
 | Binary Name | neat-genai-studio |
-| Model | Loaded on demand (e.g. Qwen3-VL-4B-Instruct-GPTQ-a16w4) + whisper-small-a16w8 |
+| Model | Loaded on demand (e.g. Qwen3-VL-4B-Instruct-Autoround-a16w4) + whisper-small-a16w8 |
 
 ## Concept
 Runs supported language and vision-language models on a Modalix device through a web interface for chat, image analysis, model setup, and diagnostics.
@@ -58,6 +58,9 @@ All captures below come from a Modalix DevKit running the Studio, with `gemma-4-
 The photo in the vision demo is NASA's Apollo 17 view of Earth (AS17-148-22727, public domain).
 
 ## Prerequisites
+- A Modalix DevKit on **Platform 3.0.0** (Palette SDK 3.0.0.0) with Neat
+  Library v0.6.0 and LLiMa 0.6.0 installed (`sima-cli neat install core@v0.6.0`).
+  Boards still on Platform 2.1.3 need an earlier version of the Studio.
 - Installed Neat Development Environment + Neat Library.
 - The model server uses the Python environment where `pyneat` is available. The default scripts assume:
 
@@ -133,8 +136,7 @@ as `config.local.yaml.bak` so any other hand edits can be copied back.
 chat model loaded. Download one from the Hugging Face panel or seed the
 catalog during installation, as shown below. By default, `setup.sh` downloads only:
 
-- `florianvoss/whisper-small-a16w8-layered-encoder` (ASR; stored as
-  `florianvoss@whisper-small-a16w8-layered-encoder`)
+- `simaai/whisper-small-a16w8` (ASR; stored as `whisper-small-a16w8`)
 - `thenlper/gte-small` (RAG embedding)
 
 Downloaded models are stored under `/media/nvme/llima/models` by default. That
@@ -158,14 +160,11 @@ Other useful environment variables:
 - `CHAT_MODEL_REPO`: optionally download **and preload** one chat/VLM model at
   startup (empty by default, i.e. none).
 - `ASR_MODEL_REPO`: the speech-to-text model installed and made active at
-  startup (default `florianvoss/whisper-small-a16w8-layered-encoder`; set to
-  `""` to install none). Current LLiMa splits the Whisper encoder into one ELF
-  per layer and refuses the older monolithic builds; on a runtime that needs a
-  monolithic encoder pass `ASR_MODEL_REPO=simaai/whisper-small-a16w8`. Setup
-  checks the model loads and leaves it out of the startup configuration if the
+  startup (default `simaai/whisper-small-a16w8`; set to `""` to install
+  none). Setup checks the model loads and leaves it out of the startup configuration if the
   runtime refuses it, rather than configuring a model that cannot be used.
 - `ASR_CATALOG_MODEL_REPOS`: space-separated extra ASR repos to seed the
-  catalog, e.g. `florianvoss/whisper-medium-a16w8-layered-encoder`, so you can
+  catalog, e.g. `simaai/whisper-medium-a16w8`, so you can
   switch between them
   at runtime from **Settings → Models**.
 - `MAX_RESIDENT_CHAT_MODELS`: how many chat/VLM models stay loaded together
@@ -209,13 +208,13 @@ server:
     max_resident_chat_models: 1             # chat/VLM models resident at once
     chat: []                                # optional: none preloaded by default.
       # To preload a model at startup instead, list it here, e.g.:
-      # - name: Qwen3-VL-4B-Instruct-GPTQ-a16w4
-      #   path: /media/nvme/llima/models/Qwen3-VL-4B-Instruct-GPTQ-a16w4
+      # - name: Qwen3-VL-4B-Instruct-Autoround-a16w4
+      #   path: /media/nvme/llima/models/Qwen3-VL-4B-Instruct-Autoround-a16w4
     asr:                                    # active at startup; switchable at runtime
       # What a default ./setup.sh installs. A repo from an account other than
       # simaai is stored as "<org>@<name>", which is the name to use here.
-      name: florianvoss@whisper-small-a16w8-layered-encoder
-      path: /media/nvme/llima/models/florianvoss@whisper-small-a16w8-layered-encoder
+      name: whisper-small-a16w8
+      path: /media/nvme/llima/models/whisper-small-a16w8
       # On a runtime that needs a monolithic encoder instead, install with
       # ASR_MODEL_REPO=simaai/whisper-small-a16w8 and use:
       #   name: whisper-small-a16w8
@@ -252,8 +251,7 @@ sidebar. Both methods stop the UI and model server cleanly, just like
 
 ### Terminal chat (CLI)
 Prefer the terminal? `--cli` starts the model server (clearing stale processes
-first, as usual) and drops you into an interactive chat instead of the web UI.
-`/reset` performs the same explicit accelerator reset as the web UI's button:
+first, as usual) and drops you into an interactive chat instead of the web UI:
 
 ```bash
 ./run.sh --cli    # or `neat-ai --cli`
@@ -287,7 +285,6 @@ and the OpenAI endpoint to stream replies). Type a message to chat; commands:
 /system <text>   set a system prompt (empty clears it)
 /new             clear the conversation
 /export [file]   save this chat to a .log file (default neat-chat-<time>.log)
-/reset           reset the accelerator (MLA) and restart the model server
 /tokens <n>      set max response tokens
 /think [on|off]  let reasoning models think before answering (default on):
                  the reasoning streams dimmed, is counted separately, and stays
@@ -307,7 +304,7 @@ terminal (`$E = mc^2$` → `E = mc²`, `\frac`, `\sqrt`, Greek letters, `\sum`, 
 
 Anything the CLI waits on is drawn as one moving status line, so a long wait
 never looks like a hang: a spinner with a running timer while it connects to
-the model server, starts the RAG service, waits out an accelerator reset or
+the model server, starts the RAG service, or
 waits for the first token of a reply, and a progress bar for model loads
 (percentage, stage count, elapsed time and an estimated time left), unloads,
 downloads (size, transfer rate and time left) and benchmarks. An unload bar
@@ -318,8 +315,12 @@ only on a real terminal; with output redirected to a file or a pipe the CLI
 prints plain lines instead.
 
 Ctrl+C stops the current reply; it prints per-response timing (tokens, TTFT,
-tok/s). Exiting shuts the model server down. Use **↑/↓** at the prompt to recall
-previous prompts (history persists across sessions in `~/.neat_ai_history`).
+tok/s). Exiting shuts the model server down. If the model server crashes,
+`run.sh` relaunches it (load a model again with `/load`), up to
+`MLA_MAX_RESTART_RETRIES` times in a row (default 4); a relaunch that stays up
+for `RELAUNCH_STABLE_SECONDS` (default 60) resets the count. Use **↑/↓** at the
+prompt to recall previous prompts (history persists across sessions in
+`~/.neat_ai_history`).
 
 `/camera <index>` **arms** a camera attached **to the board** (the CLI runs on
 the board, unlike the web UI, which uses the browser's camera). Once armed, every
@@ -378,10 +379,8 @@ default 10). `run.sh` records its PID in `.neat-genai-studio.pid` (used by
 
 On launch, `run.sh` stops stale model-server/UI processes from an interrupted
 Studio run and waits for the model-server port to become available. It does not
-restart the MLA dispatcher, initialize the MLA, or run a board-runtime recovery
-script on startup, and model/runtime failures are reported rather than silently
-recovered from. The accelerator is only ever reset when you explicitly ask for
-it — see [Reset the accelerator](#reset-the-accelerator).
+reset or recover the board runtime, and model/runtime failures are reported
+rather than silently recovered from.
 
 Open the Flask UI:
 
@@ -515,7 +514,7 @@ GET  /models/status, /models/catalog; POST /models/load, /models/unload, /models
 POST /models/max-resident {"limit": n}   how many chat/VLM models stay loaded together
 POST /models/unload-all                  unload every chat/VLM model (speech-to-text stays)
 POST /models/active {"name": "..."}      mark a loaded model most recently used (evicted last)
-GET  /models/residency                   what is loaded right now, the limit, and models lost to an outside reset
+GET  /models/residency                   what is loaded right now, the limit, and models that stopped answering
 GET  /models/memory                      accelerator memory: pool size, held by the runtime, per-model estimates
 POST /compare/stream {"turn", "model"}   one model's streamed answer to a side-by-side turn (the web UI's Compare)
 POST /compare/choose {"turn", "answer"}  record which answer the conversation continues from
@@ -575,8 +574,8 @@ before loading the new one, then warms it so your first message is instant.
 </p>
 
 If a switch hits an accelerator error, the Studio rolls back the failed model
-registration and reports the error. It does not restart or reset board services
-on its own — use **Reset MLA** below if the accelerator is genuinely wedged.
+registration and reports the error. It does not restart or reset board services;
+restart the Studio to free the accelerator, then load the model again.
 
 ### Keep several models loaded
 **Settings → Models → Max loaded models** sets how many chat/VLM models stay on the
@@ -594,13 +593,10 @@ RAM that `free` reports) and two things inside it:
 The meter refreshes every two seconds while it is on screen, so memory taken
 or released by anything on the board shows up without reloading.
 
-- **Held by the runtime** is measured: the pool memory the MLA dispatcher has
-  taken, for every program on the board. This is what decides whether another
-  model fits. The dispatcher does not always hand memory back when a model is
-  unloaded, so it can stay high with little loaded; when it is nearly full,
-  loads fail until **Reset MLA** releases it. Reading it needs root or
-  passwordless `sudo` (as Reset MLA does); set `STUDIO_MLA_MEMORY_SUDO=0` to
-  never use `sudo` for it, and the meter then shows the estimate only.
+- **Held by the runtime** is not shown on Platform 3.0. Platform 2.1 measured
+  it from the MLA dispatcher's memory map; Platform 3.0 has no dispatcher (the
+  runtime drives the MLA from the model server itself), so the meter shows the
+  estimate below. Models loaded by other programs are not counted.
 - **The coloured segments** are the models loaded here, speech-to-text
   included. Their sizes are estimates, taken from each model's accelerator
   files, because the board has no per-model counter. A model that does not fit fails to load with the
@@ -658,16 +654,13 @@ of the API, or another program resetting the accelerator.
   `/upload`), rather than failing partway through. The terminal chat checks
   the same way before each message and does not quietly send it to a different
   model.
-- The model server watches the MLA dispatcher, which holds every loaded model.
-  If it is restarted by something other than the Studio, the server sends each
-  model it still lists a one-token request (speech models a short silent
-  clip). Any that no longer answer are reported as unloaded, with the reason
-  *the accelerator was reset by another program*. The same check runs for a
-  model whose generation fails.
+- When a model's generation fails, the model server sends each model it
+  still lists a one-token request (speech models a short silent clip). Any
+  that no longer answer are reported as unloaded.
 
 A model the accelerator dropped can simply be loaded again. If loads then fail
-as well, the model server has lost its connection to the dispatcher: use
-**Reset MLA**, which restarts both.
+as well, restart the Studio (`./run.sh`): on Platform 3.0 the runtime lives in
+the model server process, so stopping it frees everything it held.
 
 ### Switch the speech-to-text model
 The same tab lists your speech-to-text (ASR) models in their own
@@ -676,16 +669,16 @@ same slot. Exactly one is active — marked `● active` — and pressing **Use*
 another evicts it and makes the new one active, without restarting and without
 clearing the conversation. The chat model stays loaded throughout.
 
-`setup.sh` installs `florianvoss/whisper-small-a16w8-layered-encoder` by
-default — a layered-encoder build, which is what current LLiMa requires. To
-install a different or additional model:
+`setup.sh` installs `simaai/whisper-small-a16w8` by default, from SiMa's
+[speech and audio collection](https://huggingface.co/collections/simaai/speech-and-audio-models).
+To install a different or additional model:
 
 ```bash
 # Replace the default:
-ASR_MODEL_REPO="florianvoss/whisper-medium-a16w8-layered-encoder" ./setup.sh
+ASR_MODEL_REPO="simaai/whisper-medium-a16w8" ./setup.sh
 
 # Or keep whisper-small and seed extra models to switch between at runtime:
-ASR_CATALOG_MODEL_REPOS="florianvoss/whisper-medium-a16w8-layered-encoder" ./setup.sh
+ASR_CATALOG_MODEL_REPOS="simaai/whisper-medium-a16w8" ./setup.sh
 ```
 
 You can also download any Whisper build from **Settings → Add Model** while the
@@ -697,44 +690,6 @@ what a restart re-selects, and the model it names carries a `startup default`
 badge. Edit it to make a different choice permanent. Set `STUDIO_ASR_WARMUP=0`
 to skip the warm-up a switch performs (the first transcription then pays the
 load cost instead).
-
-### Reset the accelerator
-Models are held by the MLA shared-memory dispatcher, which outlives the studio's
-own processes — so if a load wedges it, restarting the studio does not clear it.
-**Settings → Models → Reset MLA** (or `/reset` in the CLI) unloads everything and
-asks `run.sh` to restart the dispatcher and relaunch the model server. The web UI
-stays up and reconnects on its own; expect a few seconds of unavailability, and
-any in-progress generation stops.
-
-This is the **only** thing in the studio that touches the board runtime, and it
-never happens on its own — not at startup, and not when a model fails to load.
-
-The request normally goes through the model server's control API, which exits
-with a sentinel status that `run.sh` acts on. A server wedged inside a native
-model load cannot answer that API at all, so when the request times out the web
-UI and the CLI instead write a request file (`.neat-genai-reset.request`, see
-`NEAT_RESET_REQUEST_FILE`) that `run.sh` polls every second: it stops the server
-itself (TERM, then KILL after `SHUTDOWN_GRACE_SECONDS`), resets the dispatcher
-and relaunches. Both paths share the relaunch budget (`MLA_MAX_RESTART_RETRIES`
-consecutive relaunches that fail within `RELAUNCH_STABLE_SECONDS`) and both are
-refused when `MLA_RESET=0`.
-
-By default **Reset MLA** needs no token. The reset is board-wide and the web UI
-has no login, so on a network you do not trust, start the Studio with
-`STUDIO_RESET_AUTH=1` to require a **reset token** from any client that is not
-on the board itself: `run.sh` then generates one (kept in
-`.neat-genai-reset.token`, mode 0600) and prints it at startup, and the browser
-asks for it the first time you press **Reset MLA** and remembers it. Set
-`STUDIO_RESET_TOKEN` as well to choose the value. The CLI's `/reset` talks to
-the local control API and is unaffected either way.
-
-Restarting the dispatcher needs privileges. `run.sh` prefers the board's own
-`fix_devkit_runtime.sh` when present and otherwise restarts
-`simaai-appcomplex.service` via `sudo`, so run the studio as root, give the
-account passwordless sudo for those commands, or point `MLA_RESET_CMD` at your
-own reset command. Without privileges the model server still relaunches, the
-dispatcher is left alone, and a warning says so. `MLA_RESET=0` refuses the
-request outright.
 
 ### Download models from Hugging Face
 When the board is online, the **Settings → Add Model** tab appears (it's hidden
@@ -902,20 +857,23 @@ selector in Settings.
   language (a few seconds) and other languages load on their first spoken
   reply. Without Supertonic every installed engine loads at startup as before.
 - **Supertonic runs in its own venv and worker too.** Its runtime needs `pyneat`,
-  `onnxruntime` and `numpy 1.26`, which the UI venv does not carry, so `setup.sh`
-  builds `./.venv-supertonic` (requirements in
-  `src/python/requirements-supertonic.txt`, plus the PyNeat wheel fetched with
-  `sima-cli neat install core -t pyneat`) and downloads the model files with
-  the venv's `hf`: the upstream CPU models and voice styles from
+  `onnxruntime` and the numpy PyNeat is built against (2.2 on Platform 3.0),
+  which the UI venv does not carry, so `setup.sh` builds `./.venv-supertonic`
+  (requirements in `src/python/requirements-supertonic.txt`, with the PyNeat
+  installed in `~/pyneat` linked in, or a PyNeat wheel when the Python versions
+  differ). It downloads the upstream CPU models and voice styles from
   [Supertone/supertonic-3](https://huggingface.co/Supertone/supertonic-3) and
-  the precompiled MLA packages from
-  [florianvoss/supertonic-3-sima](https://huggingface.co/florianvoss/supertonic-3-sima),
-  both at commit revisions pinned in `setup.sh` and verified by SHA-256. No
+  the runtime constants from
+  [florianvoss/supertonic-3-sima](https://huggingface.co/florianvoss/supertonic-3-sima)
+  at commit revisions pinned in `setup.sh`, and the two models compiled for
+  Platform 3.0 from the SiMa model zoo with `sima-cli download` (pinned in
+  `src/python/ui/supertonic_sima/model_assets.json`), all verified by SHA-256.
+  On a board older than Platform 3.0, `setup.sh` skips Supertonic. No
   on-device compilation is needed, and nothing is cloned from an external
   repository: the runtime package itself is vendored in
   `src/python/ui/supertonic_sima/` (see its README for provenance and how to
   refresh it). Every `setup.sh` run (including `--dependencies-only`) checks all
-  19 model files against the SHA-256 of the pinned revisions and re-fetches any
+  17 model files against the SHA-256 of the pinned revisions and re-fetches any
   that are missing or different, so an interrupted, corrupted or outdated
   download is repaired; a venv whose build fails part-way is removed rather than
   left half-installed. The models root and the venv path are persisted under
@@ -932,8 +890,7 @@ selector in Settings.
   without `UPDATE_DEPS=1`. Installs made before the runtime was vendored keep working:
   their `app_root` config key maps to `<app_root>/models`, and the old venv and
   checkout can simply be deleted. The worker holds the two Supertonic models on
-  the MLA next to the chat and speech-to-text models. An accelerator reset
-  (**Reset MLA**) tears the worker down; the next spoken reply respawns it.
+  the MLA next to the chat and speech-to-text models.
 
 The authoritative reviewed catalog is `src/python/ui/voice_catalog.json`. Each
 entry has a compact licence label, pinned upstream repository revision, and
@@ -1098,7 +1055,7 @@ curl -s http://127.0.0.1:9997/control/max_resident \
 # re-selects as "configuredAsrModel".
 curl -s http://127.0.0.1:9997/control/asr \
   -H 'Content-Type: application/json' \
-  -d '{"name":"florianvoss@whisper-medium-a16w8-layered-encoder"}' | python3 -m json.tool
+  -d '{"name":"whisper-medium-a16w8"}' | python3 -m json.tool
 ```
 
 Check text chat:

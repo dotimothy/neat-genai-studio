@@ -187,8 +187,11 @@ class EnvironmentDiscoveryTests(unittest.TestCase):
                 (models / "supertonic-3" / "onnx").mkdir(parents=True)
                 (models / "supertonic-3" / "onnx" / "tts.json").write_text("{}")
                 (models / "supertonic-3-sima").mkdir(parents=True)
-                (models / "supertonic-3-sima"
-                 / "supertonic_vector_field_sima_mpk.tar.gz").write_bytes(b"")
+                for name in ("supertonic_vector_estimator_batch2_mpk.tar.gz",
+                             "supertonic_vocoder_bf16_mpk.tar.gz"):
+                    (models / "supertonic-3-sima" / name).write_bytes(b"")
+                self.assertFalse(supertonic_tts.available())   # runtime data missing
+                (models / "supertonic-3-sima" / "supertonic_runtime_data.npz").write_bytes(b"")
                 self.assertTrue(supertonic_tts.available())
 
     def test_supertonic_venv_env_names_the_interpreter(self):

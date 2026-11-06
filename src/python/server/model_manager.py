@@ -23,7 +23,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import threading
 import time
 import urllib.error
@@ -33,7 +32,14 @@ from pathlib import Path
 
 from shared.chat_template import generation_opens_thinking, repair_chat_template_files
 from shared.config import (HubConfig, classify_model_dir, model_dir_complete,
-                           model_dir_supported)
+                           model_runtime_dirs)
+
+
+def _target_dir(path) -> Path:
+    """Where a model's runtime files live: the package root for a flat model,
+    the target's subfolder for a target/draft (speculative decoding) pair."""
+    components = model_runtime_dirs(Path(path))
+    return components[0] if components else Path(path)
 
 
 def parse_param_count(name: str) -> str | None:
@@ -142,127 +148,56 @@ def mla_pool_bytes(base: Path = _RESERVED_MEMORY_DIR) -> int | None:
     return sum(size for _addr, size in mla_pool_regions(base)) or None
 
 
-def claimed_from_maps(maps_text: str, regions: list[tuple[int, int]]) -> int:
-    """Pool memory a process has mapped, from its ``/proc/<pid>/maps``.
+# On Platform 3.0 every program allocates its accelerator memory itself, from
+# the DMS pool, as dma-bufs exported under this name.
+_MLA_DMABUF_EXPORTER = "simaai,dms"
 
-    Counts the ``/dev/simaai-mem`` mappings whose offset (a physical address)
-    lies inside the pool; each distinct piece once, however often it is mapped.
+
+def mla_held_bytes(proc: Path = Path("/proc"), exporter: str = _MLA_DMABUF_EXPORTER) -> int | None:
+    """Pool memory held right now, board-wide: the size of every ``simaai,dms``
+    dma-buf any process has open, each buffer once (by inode) however many
+    descriptors or processes share it.
+
+    Measured, not estimated: it includes other programs on the accelerator and
+    memory a model left behind. Processes this user may not inspect (another
+    user's, without root) are not counted. None when ``/proc`` cannot be read.
     """
-    seen = set()
-    for line in maps_text.splitlines():
-        parts = line.split()
-        if len(parts) < 6 or not parts[5].endswith("simaai-mem"):
-            continue
-        try:
-            lo, hi = (int(x, 16) for x in parts[0].split("-"))
-            offset = int(parts[2], 16)
-        except ValueError:
-            continue
-        if any(addr <= offset < addr + size for addr, size in regions):
-            seen.add((offset, hi - lo))
-    return sum(size for _offset, size in seen)
-
-
-# The process that owns accelerator memory on behalf of every client.
-_MLA_DISPATCHER_COMM = "mlashmcomplex"
-
-
-def _dispatcher_pid() -> int | None:
     try:
-        entries = os.listdir("/proc")
+        pids = [d for d in os.listdir(proc) if d.isdigit()]
     except OSError:
         return None
-    for entry in entries:
-        if not entry.isdigit():
-            continue
+    sizes: dict[str, int] = {}
+    for pid in pids:
+        fd_dir = proc / pid / "fd"
         try:
-            with open(f"/proc/{entry}/comm", encoding="utf-8") as fh:
-                if fh.read().strip() == _MLA_DISPATCHER_COMM:
-                    return int(entry)
+            fds = os.listdir(fd_dir)
         except OSError:
             continue
-    return None
-
-
-def dispatcher_identity() -> tuple[int, int] | None:
-    """(pid, start time) of the MLA dispatcher, or None when it is not running.
-
-    The dispatcher holds every loaded model. A different identity than the one
-    seen when a model was loaded means it was restarted by something else, and
-    whatever it held is gone, even though this process still lists the model.
-    """
-    pid = _dispatcher_pid()
-    if pid is None:
-        return None
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
-            # The command name may contain spaces; the fields follow its ")".
-            fields = fh.read().rsplit(")", 1)[1].split()
-        return pid, int(fields[19])              # field 22: start time
-    except (OSError, IndexError, ValueError):
-        return pid, 0
-
-
-# The dispatcher's control socket. Every connected client shows up in
-# /proc/net/unix as one connected (state 03) socket under this path, readable
-# without privileges.
-_MLA_CTRL_SOCKET = "/tmp/mlactrl"
-
-
-def dispatcher_client_count(path: str = _MLA_CTRL_SOCKET,
-                            table: str = "/proc/net/unix") -> int | None:
-    """How many programs are connected to the MLA dispatcher, or None when
-    that cannot be read."""
-    try:
-        with open(table, encoding="utf-8") as fh:
-            rows = fh.read().splitlines()[1:]
-    except OSError:
-        return None
-    count = 0
-    for row in rows:
-        parts = row.split()
-        if len(parts) >= 8 and parts[7] == path and parts[5] == "03":
-            count += 1
-    return count
-
-
-def read_dispatcher_maps() -> str | None:
-    """The dispatcher's memory map, or None when it cannot be read.
-
-    The dispatcher runs as root, so its map is readable directly only when
-    this process is root too; otherwise passwordless ``sudo`` is tried (the
-    same privilege Reset MLA relies on). ``STUDIO_MLA_MEMORY_SUDO=0`` turns
-    that off, and the meter then shows the per-model estimate only.
-    """
-    pid = _dispatcher_pid()
-    if pid is None:
-        return None
-    path = f"/proc/{pid}/maps"
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return fh.read()
-    except OSError:
-        pass
-    if os.environ.get("STUDIO_MLA_MEMORY_SUDO", "1") == "0" or not shutil.which("sudo"):
-        return None
-    try:
-        out = subprocess.run(["sudo", "-n", "cat", path], capture_output=True,
-                             text=True, timeout=3, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return out.stdout if out.returncode == 0 and out.stdout else None
+        for fd in fds:
+            try:
+                if not os.readlink(fd_dir / fd).startswith("/dmabuf"):
+                    continue
+                info = (proc / pid / "fdinfo" / fd).read_text()
+            except OSError:
+                continue
+            fields = dict(line.split(":", 1) for line in info.splitlines() if ":" in line)
+            if fields.get("exp_name", "").strip() != exporter:
+                continue
+            try:
+                size = int(fields.get("size", "0"))
+            except ValueError:
+                continue
+            sizes[fields.get("ino", "").strip() or f"{pid}/{fd}"] = size
+    return sum(sizes.values())
 
 
 _MLA_FAILURE_MARKERS = (
-    "mlashm",
     "mla_load",
     "mla load",
     "bulk load",
-    "dispatcher is unavailable",
-    "dispatcher_unavailable",
     "warmup failed",
     "failed to acquire",
-    # Allocation failures matter as much as dispatcher ones: accelerator memory
+    # Allocation failures matter as much as load failures: accelerator memory
     # is not always reclaimed when models are switched, and the load then fails
     # with a plain "Cannot allocate memory" naming neither the MLA nor a remedy.
     "cannot allocate memory",
@@ -292,9 +227,6 @@ class ModelManager:
         openai_base_url: str,
         warmup: bool = True,
         asr_warmup: bool = True,
-        mla_reset_exit_code: int = 75,
-        mla_reset_enabled: bool = True,
-        reclaim_memory: bool = False,
         switch_settle_s: float = 0.6,
         log_tap=None,
     ) -> None:
@@ -314,16 +246,9 @@ class ModelManager:
         self._openai_base_url = openai_base_url.rstrip("/")
         self._warmup = warmup
         self._asr_warmup = asr_warmup
-        # Sentinel exit code that asks the supervisor (run.sh) to reset the MLA
-        # dispatcher and relaunch. Only ever used for an explicit user request.
-        self._mla_reset_exit_code = int(mla_reset_exit_code)
-        self._mla_reset_enabled = bool(mla_reset_enabled)
-        # Give unloaded models' accelerator memory back (see _reclaim_memory).
-        self._reclaim = bool(reclaim_memory)
-        self._reclaim_last: dict | None = None
         # After unloading the outgoing model, wait briefly so its RAII free
-        # (which returns MLA memory to the dispatcher) completes before loading
-        # the replacement — avoids transient double-residency (MLA_LOAD_FAILED).
+        # (which returns its MLA memory) completes before loading the
+        # replacement — avoids transient double-residency (MLA_LOAD_FAILED).
         self._switch_settle_s = max(0.0, float(switch_settle_s))
         self._lock = threading.RLock()
         # Serializes mutating operations (load/unload/delete) end-to-end WITHOUT
@@ -336,10 +261,9 @@ class ModelManager:
         self._resident: list[str] = []
         # Catalog by served name -> classification dict (name, path, type, ...).
         self._catalog: dict[str, dict] = {}
-        # The accelerator's memory pool (read once on first use) and how much
-        # of it the dispatcher holds: (read at, value, seconds to keep it).
+        # The accelerator's memory pool (read once on first use).
         self._mla_regions: list[tuple[int, int]] | None = None
-        self._mla_claimed_cache: tuple[float, int | None, float] = (float("-inf"), None, 0.0)
+        self._mla_held_cache: tuple[float, int | None] = (-1e9, None)
         # On-disk weight size per model dir (cached; dirs are static once present).
         self._size_cache: dict[str, int] = {}
         # Weight-completeness per model dir (cached; cleared on each rescan).
@@ -367,7 +291,6 @@ class ModelManager:
         # Registered names that failed verification and could not be removed
         # from the runtime's registry either: reported as not loaded.
         self._gone: set[str] = set()
-        self._dispatcher_seen = dispatcher_identity()
         self._verifying = False
         # Last load failure, retained so the UI can surface it prominently.
         self._last_error: dict | None = None
@@ -453,7 +376,8 @@ class ModelManager:
         key = str(path)
         cached = self._opens_thinking_cache.get(key)
         if cached is None:
-            cached = (generation_opens_thinking(path), generation_opens_thinking(path, False))
+            target = _target_dir(path)
+            cached = (generation_opens_thinking(target), generation_opens_thinking(target, False))
             self._opens_thinking_cache[key] = cached
         return cached
 
@@ -467,7 +391,7 @@ class ModelManager:
         if key not in self._context_cache:
             value = None
             try:
-                raw = json.loads((Path(path) / "devkit" / "vlm_config.json").read_text(encoding="utf-8"))
+                raw = json.loads((_target_dir(path) / "devkit" / "vlm_config.json").read_text(encoding="utf-8"))
                 n = int((raw.get("pipeline_cfg") or {}).get("max_num_tokens") or 0)
                 value = n if n > 0 else None
             except (OSError, ValueError, TypeError, AttributeError):
@@ -493,7 +417,6 @@ class ModelManager:
         entries = []                                # outside the lock (walks are slow)
         for info in infos:
             complete, reason = self._is_model_complete(info.get("path"))
-            supported, unsupported_reason = model_dir_supported(info.get("path"))
             path = info.get("path")
             entries.append({
                 "name": info["name"],
@@ -529,8 +452,8 @@ class ModelManager:
                 # Distinct from "complete": an unsupported build downloaded
                 # perfectly. Conflating them tells the user to re-download
                 # gigabytes that will fail the same way.
-                "supported": supported,
-                "unsupportedReason": unsupported_reason or None,
+                "supported": True,
+                "unsupportedReason": None,
             })
         entries.sort(key=lambda e: (e["type"] == "asr", e["name"].lower()))
         return entries
@@ -602,9 +525,8 @@ class ModelManager:
     def residency(self) -> dict:
         """Chat/VLM models resident now (most recently used first) and the limit."""
         # Other clients of this server (another browser, the CLI, the API) load
-        # and unload models too, and the accelerator can be reset from outside:
-        # report what is loaded now, not what this object last did.
-        self._check_dispatcher()
+        # and unload models too: report what is loaded now, not what this
+        # object last did.
         self._sync_resident_from_server()
         with self._lock:
             state = {
@@ -613,10 +535,6 @@ class ModelManager:
                 "maxResidentLimit": MAX_RESIDENT_LIMIT,
                 "lost": list(self._lost),
                 "verifying": self._verifying,
-                "reclaim": {
-                    "enabled": self._reclaim,
-                    "last": dict(self._reclaim_last) if self._reclaim_last else None,
-                },
             }
         state["mla"] = self.mla_memory()
         return state
@@ -632,47 +550,11 @@ class ModelManager:
 
     # -- models that went away without being unloaded here ----------------------
 
-    def _check_dispatcher(self) -> None:
-        """Notice an accelerator reset this process did not ask for.
-
-        Cheap (two /proc reads), so it runs on every status call. When the
-        dispatcher's identity changed while models are registered, they are
-        verified in the background and the ones that no longer answer are
-        reported as lost.
-        """
-        current = dispatcher_identity()
-        if current is None or current == self._dispatcher_seen:
-            return                       # unchanged, or mid-restart: look again later
-        if self._dispatcher_seen is None:
-            self._dispatcher_seen = current          # first sighting
-            return
-        if self._loading or self._verifying:
-            return
-        self._dispatcher_seen = current
-        if not self._server_model_names():
-            return
-        logging.warning("the MLA dispatcher was restarted outside the studio; "
-                        "verifying the loaded models")
-        self._verifying = True
-        threading.Thread(
-            target=self._verify_quietly,
-            args=("the accelerator was reset by another program",),
-            name="verify-loaded", daemon=True).start()
-
-    def _verify_quietly(self, reason: str) -> None:
-        try:
-            self.verify_loaded(reason=reason)
-        except Exception:  # noqa: BLE001 - a background check must not crash
-            logging.exception("verifying the loaded models failed")
-        finally:
-            self._verifying = False
-
     def verify_loaded(self, name: str | None = None, reason: str = "") -> dict:
         """Check that the models the runtime lists really answer.
 
         Each one gets a one-token request (speech models a short silent clip).
-        A model that no longer answers was unloaded behind our back, by an
-        accelerator reset or another program: it is taken out of the loaded
+        A model that no longer answers was unloaded behind our back: it is taken out of the loaded
         set and recorded in ``lost`` so clients can tell the user. Checks one
         model when ``name`` is given, otherwise all of them.
         """
@@ -723,14 +605,13 @@ class ModelManager:
             del self._lost[:-10]
 
     def mla_memory(self) -> dict:
-        """Accelerator memory: the pool's size, how much of it the runtime is
-        holding, and an estimate of what the models loaded here take up.
+        """Accelerator memory: the pool's size, how much of it is held, and an
+        estimate of what the models loaded here take up.
 
-        ``claimedBytes`` is measured: the pool memory the MLA dispatcher has
-        mapped, for every program on the board. It is what decides whether
-        another model fits, and it is not always handed back when models are
-        unloaded (Reset MLA releases it). None when the dispatcher's memory map
-        cannot be read.
+        ``claimedBytes`` is measured, board-wide: every ``simaai,dms`` dma-buf
+        open on the board (see ``mla_held_bytes``), which is what decides
+        whether another model fits. It includes other programs on the
+        accelerator. None when the pool or ``/proc`` cannot be read.
 
         ``usedBytes`` / ``models`` are an estimate: the size of each loaded
         model's ELF stages, which is what gets transferred to the accelerator.
@@ -746,27 +627,20 @@ class ModelManager:
                 models[name] = size
         return {
             "totalBytes": total or None,
-            "claimedBytes": self._mla_claimed_bytes(),
+            "claimedBytes": self._mla_held() if total else None,
             "usedBytes": sum(models.values()),
             "models": models,
             "estimated": True,
         }
 
-    def _mla_claimed_bytes(self) -> int | None:
-        """Pool memory held by the dispatcher, cached briefly: status is polled
-        about once a second during a load and this may shell out to sudo."""
-        if not self._mla_regions:
-            return None
+    def _mla_held(self) -> int | None:
+        """``mla_held_bytes``, cached briefly: the meter polls every couple of
+        seconds and status about once a second during a load."""
         now = time.monotonic()
-        cached_at, value, ttl = self._mla_claimed_cache
-        if now - cached_at < ttl:
-            return value
-        maps = read_dispatcher_maps()
-        value = claimed_from_maps(maps, self._mla_regions) if maps is not None else None
-        # Short enough that a client polling every couple of seconds sees it
-        # move. Back off for a minute when it cannot be read, rather than
-        # retrying sudo on every poll.
-        self._mla_claimed_cache = (now, value, 1.5 if value is not None else 60.0)
+        at, value = self._mla_held_cache
+        if now - at >= 1.5:
+            value = mla_held_bytes()
+            self._mla_held_cache = (now, value)
         return value
 
     def set_max_resident(self, limit) -> dict:
@@ -800,8 +674,6 @@ class ModelManager:
                 with self._lock:
                     if victim in self._resident:
                         self._resident.remove(victim)
-            if evicted:
-                self._reclaim_memory(f"lowering the resident limit to {limit}")
         return dict(self.residency(), evicted=evicted)
 
     # -- load / unload ---------------------------------------------------------
@@ -821,10 +693,8 @@ class ModelManager:
         with self._op_lock:
             return self._load_locked(name)
 
-    def _load_locked(self, name: str, reclaim: bool = True) -> dict:
-        """``load`` for a caller already holding ``_op_lock``. ``reclaim``:
-        give an evicted model's accelerator memory back (_reclaim_memory);
-        off when that is what is loading the models back."""
+    def _load_locked(self, name: str) -> dict:
+        """``load`` for a caller already holding ``_op_lock``."""
         if name not in self._catalog:
             self.scan_catalog()
         with self._lock:
@@ -879,9 +749,6 @@ class ModelManager:
         # Refuse to load a model whose weights are missing/partial — otherwise
         # it fails deep in the MLA with a confusing error.
         complete, reason = self._is_model_complete(path)
-        ok_supported, why_unsupported = model_dir_supported(path)
-        if not ok_supported:
-            raise ValueError(f"'{name}' cannot be loaded — {why_unsupported}")
         if not complete:
             raise ValueError(
                 f"'{name}' cannot be loaded — {reason}. Re-download it from Add Model."
@@ -891,8 +758,9 @@ class ModelManager:
         # Hub layout) before the runtime's minja parser ever sees them —
         # this also fixes models downloaded before the repair existed.
         try:
-            for fix in repair_chat_template_files(path):
-                logging.info("model '%s': %s", name, fix)
+            for root in model_runtime_dirs(Path(path)) or [Path(path)]:
+                for fix in repair_chat_template_files(root):
+                    logging.info("model '%s': %s", name, fix)
         except Exception:  # noqa: BLE001 - repair is best-effort
             pass
 
@@ -973,22 +841,16 @@ class ModelManager:
             # evicted model and the new one are never briefly co-resident.
             if evicted and self._switch_settle_s:
                 time.sleep(self._switch_settle_s)
-            # ... which the dispatcher does only once it is idle.
-            if evicted and reclaim:
-                self._reclaim_memory(f"loading {name}")
 
             self._loading.update(phase="loading", victim=None)
             if name in self._gone:
-                # A stale registration from before an outside reset: clear
+                # A stale registration from a model that stopped answering: clear
                 # it so the model can be registered afresh.
                 try:
                     self._server.remove_model(name)
                 except Exception:  # noqa: BLE001 - best effort
                     pass
                 self._gone.discard(name)
-            # Whatever is loaded from here on lives in the dispatcher that
-            # is running now.
-            self._dispatcher_seen = dispatcher_identity() or self._dispatcher_seen
             # add_model returns the name the server actually served it under,
             # which may differ from the requested one — that is the truth.
             self._log_note(f"Registering {name} with the runtime…")
@@ -1143,7 +1005,8 @@ class ModelManager:
             return None
         try:
             total = sum(f.stat().st_size
-                        for f in Path(path).glob("elf_files/*_mla.elf"))
+                        for root in model_runtime_dirs(Path(path))
+                        for f in root.glob("elf_files/*_mla.elf"))
         except Exception:
             return None
         return total or None
@@ -1264,10 +1127,8 @@ class ModelManager:
     def _count_elf_stages(self, path) -> int | None:
         """Number of ELF stages on disk for a model (the load-progress total)."""
         try:
-            elf_dir = Path(path) / "elf_files"
-            if not elf_dir.is_dir():
-                return None
-            n = sum(1 for f in elf_dir.iterdir() if f.name.endswith("_mla.elf"))
+            n = sum(1 for root in model_runtime_dirs(Path(path))
+                    for f in root.glob("elf_files/*_mla.elf"))
             return n or None
         except Exception:
             return None
@@ -1382,9 +1243,14 @@ class ModelManager:
                     break
                 try:
                     obj = json.loads(data)
-                except Exception:
+                except ValueError:
                     continue
-                # Runtime metrics streamed by the server (authoritative).
+                if obj.get("error"):
+                    err = obj["error"]
+                    raise RuntimeError(err.get("message") if isinstance(err, dict) else str(err))
+                # Runtime metrics streamed by the server (authoritative),
+                # including the count of tokens generated so far.
+                tokens = obj.get("generated_tokens", tokens)
                 if "ttft" in obj:
                     try: srv_ttft = float(obj["ttft"])
                     except (TypeError, ValueError): pass
@@ -1392,14 +1258,19 @@ class ModelManager:
                     try: srv_tps = float(obj["tps"])
                     except (TypeError, ValueError): pass
                 choices = obj.get("choices") or []
-                delta = choices[0].get("delta", {}).get("content") if choices else None
+                chunk = choices[0].get("delta", {}) if choices else {}
+                # Reasoning models stream their thinking separately; it is
+                # generated tokens too.
+                delta = (chunk.get("content") or chunk.get("reasoning_content")
+                         or chunk.get("reasoning"))
                 if not delta:
                     continue
                 now = time.monotonic()
                 if t_first is None:
                     t_first = now
                 t_last = now
-                tokens += 1
+                if "generated_tokens" not in obj:
+                    tokens += 1          # no runtime count: one per chunk
                 parts.append(delta)
                 # Throttle the live update so it never perturbs the timing.
                 if now - last_live > 0.12:
@@ -1555,8 +1426,6 @@ class ModelManager:
             with self._lock:
                 if name in self._resident:
                     self._resident.remove(name)
-            if removed:
-                self._reclaim_memory(f"unloading {name}")
         return {"name": name, "state": "unloaded" if removed else "absent",
                 "unload_seconds": round(time.monotonic() - started, 1)}
 
@@ -1581,8 +1450,6 @@ class ModelManager:
                     with self._lock:
                         if name in self._resident:
                             self._resident.remove(name)
-            if unloaded:
-                self._reclaim_memory("unloading every chat model")
         return {"unloaded": unloaded, "failed": failed,
                 "unload_seconds": round(time.monotonic() - started, 1)}
 
@@ -1652,8 +1519,6 @@ class ModelManager:
             with self._lock:
                 self._size_cache.pop(str(raw_path), None)
                 self._catalog.pop(name, None)
-            if registered:
-                self._reclaim_memory(f"deleting {name}")
 
         self.scan_catalog()
         return {"name": name, "state": "deleted"}
@@ -1681,7 +1546,7 @@ class ModelManager:
                         break
                     except OSError:
                         continue
-            vlm_cfg = p / "devkit" / "vlm_config.json"
+            vlm_cfg = _target_dir(p) / "devkit" / "vlm_config.json"
             if vlm_cfg.is_file():
                 try:
                     raw = json.loads(vlm_cfg.read_text(encoding="utf-8"))
@@ -1811,154 +1676,6 @@ class ModelManager:
         except Exception as exc:  # noqa: BLE001 - surfaced to caller
             return False, str(exc)
 
-    # -- giving unloaded models' accelerator memory back --------------------------
-
-    def _reclaim_memory(self, reason: str) -> None:
-        """Make the MLA dispatcher free the memory of the model(s) just unloaded.
-
-        Measured on runtime 0.5.0: ``remove_model`` returns none of a model's
-        accelerator memory, and loading it again takes fresh memory, so a few
-        switches fill the pool and every load fails until a Reset MLA. The
-        dispatcher frees memory only when it has no clients at all, and this
-        server stays a client while any model is registered with it — the
-        speech-to-text model always is. So: unload every model, wait for the
-        dispatcher to go idle (it then frees everything), and load back the
-        ones that were still loaded, speech model first. That costs their load
-        time, and stops their in-flight generations.
-
-        Pointless while another program is connected to the dispatcher (its
-        clients keep it from going idle), so then it only reports that. Call
-        holding ``_op_lock``.
-        """
-        if not self._reclaim:
-            return
-        started = time.monotonic()
-        self._sync_resident_from_server()
-        registered = self._server_model_names()
-        clients = dispatcher_client_count()
-        # This server is one of the clients only while it has a model registered.
-        others = (clients - (1 if registered else 0)) if clients is not None else 0
-        if others > 0:
-            self._note_reclaim(
-                "blocked", started, reason,
-                f"{others} other program(s) are connected to the accelerator, so it "
-                "keeps the unloaded memory until they stop or the accelerator is reset")
-            return
-        with self._lock:
-            chats = list(reversed(self._resident))   # oldest first; the last is most recent
-            asr = self._active_asr
-        outer = self._loading
-        removed: list[str] = []
-        if registered:
-            self._log_note(
-                f"Freeing accelerator memory: unloading {', '.join(registered)} for a moment")
-            if outer:
-                outer.update(phase="freeing", victim=None)
-            for name in registered:
-                try:
-                    if self._unload_timed(name):
-                        removed.append(name)
-                except Exception as exc:  # noqa: BLE001 - still loads the rest back
-                    logging.warning("could not unload %s to free accelerator memory: %s", name, exc)
-            with self._lock:
-                self._resident = [v for v in self._resident if v not in removed]
-                if asr in removed:
-                    self._active_asr = None
-        idle = self._wait_dispatcher_idle()
-        failed: dict[str, str] = {}
-        try:
-            back = ([asr] if asr in removed else []) + [n for n in chats if n in removed]
-            for name in back:
-                self._log_note(f"Loading {name} back")
-                try:
-                    result = self._load_locked(name, reclaim=False)
-                    if (result or {}).get("state") != "ready":
-                        failed[name] = str(result)[:300]
-                except Exception as exc:  # noqa: BLE001 - reported with the result
-                    failed[name] = str(exc)[:300]
-        finally:
-            self._loading = outer
-            if outer:
-                outer.update(phase="loading", victim=None)
-        self._note_reclaim("freed" if idle else ("unconfirmed" if idle is None else "not-idle"),
-                           started, reason, failed=failed)
-
-    def _wait_dispatcher_idle(self, timeout: float = 10.0) -> bool | None:
-        """Wait until no program is connected to the dispatcher, plus a moment
-        for it to free the memory. None when that cannot be observed."""
-        deadline = time.monotonic() + timeout
-        while True:
-            count = dispatcher_client_count()
-            if count is None:
-                time.sleep(1.5)
-                return None
-            if count == 0:
-                time.sleep(0.5)
-                self._mla_claimed_cache = (float("-inf"), None, 0.0)   # re-measure
-                return True
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(0.2)
-
-    def _note_reclaim(self, result: str, started: float, reason: str, detail: str = "",
-                      failed: dict | None = None) -> None:
-        self._reclaim_last = {
-            "at": time.time(), "result": result, "reason": reason,
-            "seconds": round(time.monotonic() - started, 1),
-            "detail": detail, "failed": dict(failed or {}),
-        }
-        if result == "freed" and not failed:
-            self._log_note(f"Freed the accelerator memory in {self._reclaim_last['seconds']}s")
-        else:
-            logging.warning("freeing accelerator memory (%s): %s %s %s", reason, result,
-                            detail, failed or "")
-
-    def _request_supervised_reset(self, reason: str, message: str) -> dict:
-        """Ask the supervisor (run.sh) to reset the MLA dispatcher and relaunch.
-
-        A dispatcher restart cannot be done from inside this process — it frees
-        the models this process still holds and the runtime cannot reconnect — so
-        exit with the sentinel code once the HTTP response has had a moment to
-        flush. run.sh resets the dispatcher and relaunches just the model server;
-        the UI stays up and reconnects.
-        """
-        logging.error(
-            "requesting supervised MLA reset + relaunch (%s; exit code %d)",
-            reason, self._mla_reset_exit_code,
-        )
-
-        def _exit_soon() -> None:
-            time.sleep(1.5)
-            os._exit(self._mla_reset_exit_code)
-
-        threading.Thread(target=_exit_soon, daemon=True).start()
-        return {"state": "resetting", "reset": True, "message": message}
-
-    def reset_mla(self) -> dict:
-        """Explicit, user-triggered accelerator reset.
-
-        Drains in-flight streams best-effort and deliberately WITHOUT taking
-        ``_op_lock``: the whole point is that it still works when a load has
-        wedged and is holding that lock. Nothing else in the studio calls this —
-        startup and load failures leave the board runtime alone.
-        """
-        if not self._mla_reset_enabled:
-            # Refuse before scheduling the sentinel exit. Returning success here
-            # would still tear the server down and interrupt generations, which
-            # is exactly what MLA_RESET=0 is set to prevent.
-            raise ValueError(
-                "Accelerator reset is disabled on this board (MLA_RESET=0)."
-            )
-        for victim in list(self._resident):
-            try:
-                self._stop_model_streams(victim)
-            except Exception:
-                pass
-        return self._request_supervised_reset(
-            "user requested MLA reset",
-            "Resetting the accelerator and restarting. Reconnecting shortly…",
-        )
-
     @staticmethod
     def _is_probe_timeout(detail: str) -> bool:
         """A warm-up that ran out of time proved nothing.
@@ -2019,21 +1736,12 @@ class ModelManager:
                 "is still loaded: unload a model first if they do not all fit "
                 "in accelerator memory together."
             )
-        # Say so when the pool itself is the likely reason.
-        self._mla_claimed_cache = (float("-inf"), None, 0.0)   # re-read now
-        memory = self.mla_memory()
-        total, claimed = memory.get("totalBytes"), memory.get("claimedBytes")
-        if total and claimed and claimed >= 0.9 * total:
-            shared += (
-                f" The accelerator's memory pool is nearly full: the runtime is "
-                f"holding {claimed / 2**30:.1f} of {total / 2**30:.1f} GB."
-            )
         raise RuntimeError(
             f"Model '{name}' could not be loaded: the accelerator (MLA) reported "
             f"an error.{shared} Accelerator memory is not always reclaimed when "
             "models are switched, so this can follow several switches even when "
-            "the model fits on its own. Use 'Reset MLA' in Settings -> Models (or "
-            "/reset in the CLI) to clear the accelerator, then load it again."
+            "the model fits on its own. Restart the Studio to free the "
+            "accelerator, then load it again."
         )
 
     # -- status ----------------------------------------------------------------

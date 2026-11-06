@@ -21,7 +21,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - environment check
     ) from exc
 
 from server.model_manager import ModelManager, _is_mla_failure
-from shared.config import HubConfig, model_dir_complete, model_dir_supported
+from shared.config import HubConfig, classify_model_dir, model_dir_complete
 
 
 class FakeServer:
@@ -309,12 +309,6 @@ class AsrSwitchingTests(unittest.TestCase):
         self.assertNotEqual(alias, manager.resolved_model_path("whisper-medium-a16w8"))
         self.assertIsNone(manager.resolved_model_path("not-in-catalog"))
 
-    def test_reset_is_refused_when_disabled(self):
-        manager, _ = self.manager()
-        manager._mla_reset_enabled = False
-        with self.assertRaisesRegex(ValueError, "disabled"):
-            manager.reset_mla()
-
     def test_configured_alias_survives_a_normalized_served_name(self):
         # The runtime serves the configured alias under another name. The
         # configured alias must still be what a restart re-selects, and its
@@ -510,13 +504,13 @@ class EncoderLayoutIsNotJudgedLocallyTests(unittest.TestCase):
 
     def test_a_combined_encoder_build_is_offered(self):
         d = self._build(self.tmp, "combined", ["m_encoder_stage1_mla.elf"])
-        self.assertEqual(model_dir_supported(d), (True, ""))
+        self.assertEqual(classify_model_dir(d)["type"], "asr")
         self.assertEqual(model_dir_complete(d), (True, ""))
 
     def test_a_layered_encoder_build_is_offered(self):
         d = self._build(self.tmp, "layered",
                         [f"m_encoder_layer{i}_stage1_mla.elf" for i in range(12)])
-        self.assertEqual(model_dir_supported(d), (True, ""))
+        self.assertEqual(classify_model_dir(d)["type"], "asr")
         self.assertEqual(model_dir_complete(d), (True, ""))
 
     def test_a_genuinely_broken_download_is_still_caught(self):
@@ -533,13 +527,11 @@ class MlaFailureClassificationTests(unittest.TestCase):
 
     Misclassifying one costs the user the remedy: the load is not rolled back
     and the error arrives as a raw runtime string instead of the message that
-    names Reset MLA.
+    names the remedy.
     """
 
-    def test_dispatcher_and_allocation_failures_are_recognised(self):
+    def test_load_and_allocation_failures_are_recognised(self):
         for detail in (
-            'Failed to bulk load model through MLASHM dispatcher: "...stage1_mla.elf" '
-            "(code=8 job_type=loadMany component=rpcmlashm name=MLA_LOAD_FAILED op_name=MLA_LOAD)",
             "Failed to allocate buffer (per_layer_embeddings_s1): Cannot allocate memory",
             "GenAIServer warmup failed for model 'x': Failed to open shm memory handle",
         ):
