@@ -978,7 +978,19 @@ fi
 export NEAT_RUN_PID="$$"
 export RUN_PID_FILE="${PID_FILE}"
 
+# The model server reads its config with PyYAML, in the Neat environment. Installs made before
+# setup.sh checked for it (or a Neat environment rebuilt since) may not have it: add it once.
+ensure_server_deps() {
+  "${PYNEAT_PYTHON}" -c 'import yaml' >/dev/null 2>&1 && return 0
+  info "Installing PyYAML into the Neat environment (${PYNEAT_PYTHON}): the model server needs it"
+  if ! "${PYNEAT_PYTHON}" -m pip install -q PyYAML; then
+    errln "The model server needs PyYAML in ${PYNEAT_PYTHON}: run ${PYNEAT_PYTHON} -m pip install PyYAML"
+    return 1
+  fi
+}
+
 launch_server() {
+  ensure_server_deps || return 1
   step "Starting the Neat model server (OpenAI-compatible)…"
   # In CLI mode the model server shares the terminal with the interactive chat,
   # so its logs would land on the "you ▸" prompt. Send them to a log file
