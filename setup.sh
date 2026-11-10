@@ -285,6 +285,18 @@ then
 fi
 ok "pyneat available (${C_DIM}${PYNEAT_PYTHON}${C_RESET})"
 
+# The model server runs in the Neat environment and reads its config with PyYAML. A fresh Neat
+# install's pyneat venv does not have it, and the server then stops on `import yaml`.
+if ! "${PYNEAT_PYTHON}" -c 'import yaml' >/dev/null 2>&1; then
+  step "Installing PyYAML into the Neat environment (the model server reads its config with it)"
+  if ! "${PYNEAT_PYTHON}" -m pip install -q PyYAML; then
+    errln "Could not install PyYAML into ${PYNEAT_PYTHON}."
+    info "Install it yourself: ${PYNEAT_PYTHON} -m pip install PyYAML"
+    exit 1
+  fi
+fi
+ok "PyYAML in the Neat environment"
+
 install_cpu_torch_if_needed() {
   case "$(uname -m)" in
     x86_64|amd64|aarch64|arm64)
